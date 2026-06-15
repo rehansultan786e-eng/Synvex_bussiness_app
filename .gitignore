@@ -1,0 +1,13 @@
+# Virtual Environment
+venv/
+ENV/
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Node modules (Frontend ke liye)
+frontend/node_modules/
