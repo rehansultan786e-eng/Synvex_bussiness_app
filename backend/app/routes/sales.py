@@ -1,17 +1,18 @@
-from app.services.export import export_to_excel, export_to_pdf
-from fastapi.responses import StreamingResponse
 from fastapi import APIRouter, HTTPException, Depends, Query
 from app.models.lead import LeadCreate, LeadUpdate, MeetingCreate
-from app.models.commission import CommissionStatusUpdate, CommissionRateOverride, CommissionSplitsRequest
+from app.models.commission import (
+    CommissionRateOverride, CommissionSplitsRequest, MilestonePayoutApproval
+)
 from app.services.lead import (
     create_lead, get_all_leads, get_lead_by_id, update_lead, delete_lead
 )
 from app.services.meeting import create_meeting, get_meetings_by_lead, get_all_meetings
 from app.services.commission import (
     create_commission_for_won_lead, override_commission_rate,
-    update_commission_status, get_all_commissions,
-    get_commission_summary, get_rep_rankings, set_commission_splits
+    get_all_commissions, get_commission_summary, get_rep_rankings,
+    set_commission_splits, approve_milestone_payout, reverse_milestone_commission
 )
+from app.services.export import export_to_excel, export_to_pdf
 from app.utils.dependencies import get_current_user, get_current_sales, get_current_sales_manager
 from typing import Optional
 
@@ -41,10 +42,7 @@ async def list_leads(
     current_user=Depends(get_current_sales)
 ):
     role = current_user.get("role")
-    sales_rep_id = None
-    if role == "sales_rep":
-        sales_rep_id = current_user.get("user_id")
-
+    sales_rep_id = current_user.get("user_id") if role == "sales_rep" else None
     leads = await get_all_leads(status=status, sales_rep_id=sales_rep_id, platform=platform)
     return {"message": "Success", "data": leads, "total": len(leads)}
 
@@ -67,6 +65,7 @@ async def update_existing_lead(
     lead_data: LeadUpdate,
     current_user=Depends(get_current_sales)
 ):
+    """When status moves to Won, commission record is created automatically (SAL-01/02)."""
     role = current_user.get("role")
 
     lead = await get_lead_by_id(lead_id)
@@ -119,18 +118,16 @@ async def list_all_meetings(
     return {"message": "Success", "data": meetings}
 
 
-# ===== COMMISSIONS (SRS 3.3, 3.4, 3.5) =====
+# ===== COMMISSIONS (SAL-01 to SAL-06) =====
 
 @router.get("/commissions")
 async def list_commissions(
     status: Optional[str] = Query(None),
     current_user=Depends(get_current_sales)
 ):
+    """status filters by overall_status: Pending, Approved, Paid, Cancelled, Reversed."""
     role = current_user.get("role")
-    sales_rep_id = None
-    if role == "sales_rep":
-        sales_rep_id = current_user.get("user_id")
-
+    sales_rep_id = current_user.get("user_id") if role == "sales_rep" else None
     commissions = await get_all_commissions(status=status, sales_rep_id=sales_rep_id)
     return {"message": "Success", "data": commissions, "total": len(commissions)}
 
@@ -161,43 +158,61 @@ async def update_commission_rate(
     return {"message": "Commission rate updated successfully", "data": commission}
 
 
-@router.put("/commissions/{commission_id}/status")
-async def update_commission_status_route(
-    commission_id: str,
-    status_update: CommissionStatusUpdate,
-    current_user=Depends(get_current_user)
-):
-    commission, error = await update_commission_status(
-        commission_id, status_update,
-        updated_by=current_user.get("user_id"),
-        updated_by_role=current_user.get("role")
-    )
-    if error:
-        raise HTTPException(status_code=400, detail=error)
-    return {"message": f"Commission status updated to {status_update.status}", "data": commission}
-
-
 @router.put("/commissions/{commission_id}/splits")
 async def update_commission_splits(
     commission_id: str,
     request: CommissionSplitsRequest,
     current_user=Depends(get_current_user)
 ):
-    """SAL-04: Configure split commission attribution for multi-rep deals."""
     commission, error = await set_commission_splits(commission_id, request.splits, current_user.get("role"))
     if error:
         raise HTTPException(status_code=400, detail=error)
     return {"message": "Commission splits updated successfully", "data": commission}
 
+
+@router.put("/commissions/{commission_id}/approve-milestone")
+async def approve_commission_milestone(
+    commission_id: str,
+    approval: MilestonePayoutApproval,
+    current_user=Depends(get_current_user)
+):
+    """SAL-04: Approve a specific milestone's commission payout."""
+    commission, error = await approve_milestone_payout(
+        commission_id, approval.milestone_id,
+        approved_by=current_user.get("user_id"),
+        approver_role=current_user.get("role")
+    )
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    return {"message": "Milestone commission payout approved successfully", "data": commission}
+
+
+@router.put("/commissions/{commission_id}/reverse-milestone")
+async def reverse_commission_milestone(
+    commission_id: str,
+    milestone_id: str,
+    current_user=Depends(get_current_user)
+):
+    """SAL-06: Clawback - reverse a previously approved/paid milestone commission."""
+    commission, error = await reverse_milestone_commission(
+        commission_id, milestone_id,
+        reversed_by_role=current_user.get("role")
+    )
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    return {"message": "Commission milestone reversed successfully", "data": commission}
+
+
+# ===== EXPORTS (SAL-08) =====
+
 COMMISSION_EXPORT_COLUMNS = [
     ("commission_id", "Commission ID"),
     ("lead_id", "Lead ID"),
     ("sales_rep_name", "Sales Rep"),
-    ("contract_value", "Contract Value"),
+    ("total_contract_value", "Contract Value"),
     ("rate", "Rate (%)"),
-    ("amount", "Commission Amount"),
-    ("status", "Status"),
-    ("paid_date", "Paid Date"),
+    ("total_commission_calculated", "Total Commission"),
+    ("overall_status", "Status"),
 ]
 
 
@@ -206,7 +221,6 @@ async def export_commissions_excel(
     status: Optional[str] = Query(None),
     current_user=Depends(get_current_sales)
 ):
-    """SAL-08: Export commission data to Excel."""
     role = current_user.get("role")
     sales_rep_id = current_user.get("user_id") if role == "sales_rep" else None
     commissions = await get_all_commissions(status=status, sales_rep_id=sales_rep_id)
@@ -218,7 +232,6 @@ async def export_commissions_pdf(
     status: Optional[str] = Query(None),
     current_user=Depends(get_current_sales)
 ):
-    """SAL-08: Export commission data to PDF."""
     role = current_user.get("role")
     sales_rep_id = current_user.get("user_id") if role == "sales_rep" else None
     commissions = await get_all_commissions(status=status, sales_rep_id=sales_rep_id)

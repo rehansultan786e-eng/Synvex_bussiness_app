@@ -31,10 +31,6 @@ async def generate_contract_id():
     return f"CON-{count + 1:05d}"
 
 
-async def generate_milestone_id(contract_id: str):
-    return f"{contract_id}-MS"
-
-
 async def create_contract(contract_data: ContractCreate, created_by: str):
     db = get_db()
     contract_id = await generate_contract_id()
@@ -82,10 +78,8 @@ async def get_all_contracts(client_name: str = None):
         query["client_name"] = {"$regex": client_name, "$options": "i"}
 
     contracts = await db.contracts.find(query).sort("created_at", -1).to_list(1000)
-
     for c in contracts:
         _refresh_overdue_milestones(c)
-
     return [contract_helper(c) for c in contracts]
 
 
@@ -106,9 +100,8 @@ async def get_contract_by_id(contract_id: str):
 
 def _refresh_overdue_milestones(contract: dict) -> bool:
     """
-    FIN-03: Automatically flags milestones as Overdue if due_date has passed
-    without payment. Mutates contract["milestones"] in place.
-    Returns True if any milestone was changed.
+    FIN-01: Auto-flags milestones as Overdue if due_date passed without payment.
+    Mutates contract["milestones"] in place. Returns True if any changed.
     """
     today = date.today()
     changed = False
@@ -136,11 +129,25 @@ async def update_contract(contract_id: str, contract_data: ContractUpdate):
 
 
 async def delete_contract(contract_id: str):
+    """
+    SAL-05: When a contract is deleted/cancelled, all pending commission
+    payouts for the linked lead are automatically cancelled.
+    """
     db = get_db()
+    contract = await db.contracts.find_one({"contract_id": contract_id, "is_deleted": False})
+    if not contract:
+        return False
+
     await db.contracts.update_one(
         {"contract_id": contract_id},
         {"$set": {"is_deleted": True, "updated_at": datetime.utcnow()}}
     )
+
+    # SAL-05: Cancel remaining pending commission payouts for this lead
+    if contract.get("lead_id"):
+        from app.services.commission import cancel_remaining_commission_payouts
+        await cancel_remaining_commission_payouts(contract["lead_id"])
+
     return True
 
 
@@ -199,7 +206,10 @@ async def update_milestone(contract_id: str, milestone_id: str, milestone_data: 
 
 
 async def mark_milestone_received(contract_id: str, milestone_id: str, payment_data: MilestonePaymentReceived):
-    """Finance Manager marks milestone as Received and logs date + payment method (SRS 4.2.2)."""
+    """
+    FIN-02: Finance Manager marks milestone as Received.
+    Automatically triggers commission payout calculation for this milestone (SAL-03).
+    """
     db = get_db()
     contract = await db.contracts.find_one({"contract_id": contract_id, "is_deleted": False})
     if not contract:
@@ -207,12 +217,18 @@ async def mark_milestone_received(contract_id: str, milestone_id: str, payment_d
 
     milestones = contract.get("milestones", [])
     found = False
+    milestone_amount = 0
+
     for m in milestones:
         if m["milestone_id"] == milestone_id:
+            if m["status"] == "Received":
+                return None, "Milestone is already marked as Received"
             found = True
             m["status"] = "Received"
             m["paid_date"] = str(payment_data.paid_date)
             m["payment_method"] = payment_data.payment_method
+            milestone_amount = m["amount"]
+            break
 
     if not found:
         return None, "Milestone not found"
@@ -221,11 +237,33 @@ async def mark_milestone_received(contract_id: str, milestone_id: str, payment_d
         {"contract_id": contract_id},
         {"$set": {"milestones": milestones, "updated_at": datetime.utcnow()}}
     )
+
+    # FIN-02 / SAL-03: Trigger proportional commission for this milestone
+    if contract.get("lead_id"):
+        from app.services.commission import trigger_milestone_commission
+        await trigger_milestone_commission(
+            lead_id=contract["lead_id"],
+            milestone_id=milestone_id,
+            milestone_amount=milestone_amount
+        )
+
+        # FIN notifications: Finance Manager + CEO notified of milestone received
+        from app.services.notification import create_notification
+        notif_users = await db.users.find(
+            {"role": {"$in": ["super_admin", "finance_manager"]}}
+        ).to_list(20)
+        for u in notif_users:
+            await create_notification(
+                user_id=str(u["_id"]),
+                message=f"Milestone {milestone_id} for contract {contract_id} ({contract['client_name']}) marked as Received. Amount: {milestone_amount} {contract['currency']}.",
+                notif_type="milestone_due"
+            )
+
     return await get_contract_by_id(contract_id), None
 
 
 async def get_overdue_milestones():
-    """FIN financial dashboard: Outstanding Receivables — all overdue milestones with client info."""
+    """Outstanding Receivables — all overdue milestones with client info."""
     db = get_db()
     contracts = await db.contracts.find({"is_deleted": False}).to_list(1000)
 
@@ -248,7 +286,7 @@ async def get_overdue_milestones():
 
 
 async def get_upcoming_milestones(days: int = 7):
-    """Used for FIN-04 payment reminder triggers and notifications (milestone due in N days)."""
+    """FIN-04: Milestones due within N days — for payment reminders."""
     from datetime import timedelta
     db = get_db()
     contracts = await db.contracts.find({"is_deleted": False}).to_list(1000)

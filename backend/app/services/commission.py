@@ -1,5 +1,5 @@
 from app.database.connection import get_db
-from app.models.commission import CommissionCreate, CommissionStatusUpdate, CommissionRateOverride
+from app.models.commission import CommissionCreate, CommissionRateOverride, CommissionSplitsRequest, MilestonePayoutApproval
 from datetime import datetime, date
 
 
@@ -10,13 +10,13 @@ def commission_helper(commission) -> dict:
         "lead_id": commission["lead_id"],
         "sales_rep_id": commission["sales_rep_id"],
         "sales_rep_name": commission["sales_rep_name"],
-        "contract_value": commission["contract_value"],
+        "total_contract_value": commission["total_contract_value"],
         "rate": commission["rate"],
-        "amount": commission["amount"],
-        "status": commission["status"],
+        "total_commission_calculated": commission["total_commission_calculated"],
+        "milestone_payouts": commission.get("milestone_payouts", []),
+        "overall_status": commission["overall_status"],
         "splits": commission.get("splits"),
         "approved_by": commission.get("approved_by"),
-        "paid_date": commission.get("paid_date"),
         "comments": commission.get("comments"),
         "created_at": commission["created_at"],
         "updated_at": commission.get("updated_at")
@@ -39,15 +39,14 @@ async def get_default_commission_rate(sales_rep_id: str) -> float:
         user = None
     if user and user.get("commission_rate"):
         return user["commission_rate"]
-    return 5.0  # SRS default example: 5%
+    return 5.0  # SRS default: 5%
 
 
 async def create_commission_for_won_lead(lead_id: str):
     """
-    Called automatically when a Lead status transitions to "Won" (SRS 3.2.1).
-    Commission Amount = Contract Value x Commission Rate (%)
-    Contract value is taken from the lead's estimated_value at this stage;
-    Finance module will create the formal Contract record separately.
+    SAL-01: Called automatically when a Lead transitions to Won.
+    Creates commission record with status Pending (Accrued).
+    Actual milestone payouts are created separately when milestones are received.
     """
     db = get_db()
 
@@ -60,8 +59,8 @@ async def create_commission_for_won_lead(lead_id: str):
         return commission_helper(existing), None
 
     rate = await get_default_commission_rate(lead["sales_rep_id"])
-    contract_value = lead["estimated_value"]
-    amount = round(contract_value * (rate / 100), 2)
+    total_contract_value = lead["estimated_value"]
+    total_commission_calculated = round(total_contract_value * (rate / 100), 2)
 
     commission_id = await generate_commission_id()
 
@@ -70,23 +69,250 @@ async def create_commission_for_won_lead(lead_id: str):
         "lead_id": lead_id,
         "sales_rep_id": lead["sales_rep_id"],
         "sales_rep_name": lead["sales_rep_name"],
-        "contract_value": contract_value,
+        "total_contract_value": total_contract_value,
         "rate": rate,
-        "amount": amount,
-        "status": "Pending",
+        "total_commission_calculated": total_commission_calculated,
+        "milestone_payouts": [],  # populated as milestones are received
+        "overall_status": "Pending",
         "splits": None,
         "approved_by": None,
-        "paid_date": None,
         "comments": None,
         "created_at": datetime.utcnow()
     }
     result = await db.commissions.insert_one(commission)
     new_commission = await db.commissions.find_one({"_id": result.inserted_id})
+
+    # Notify sales rep
+    from app.services.notification import create_notification
+    await create_notification(
+        user_id=lead["sales_rep_id"],
+        message=f"Deal {lead_id} marked as Won. Commission of {total_commission_calculated} ({rate}%) has been accrued and is pending milestone payments.",
+        notif_type="commission_status"
+    )
+
     return commission_helper(new_commission), None
 
 
-async def override_commission_rate(commission_id: str, override: CommissionRateOverride, updated_by_role: str):
-    """Only HR Manager or CEO (super_admin) can override commission rate per deal (SRS 3.3.1)."""
+async def trigger_milestone_commission(lead_id: str, milestone_id: str, milestone_amount: float, invoice_id: str = None):
+    """
+    SAL-03 / FIN-02: Called automatically when a milestone is marked Received.
+    Calculates proportional commission share for that milestone and adds it
+    to the commission's milestone_payouts array with status Pending.
+    """
+    db = get_db()
+
+    commission = await db.commissions.find_one({"lead_id": lead_id})
+    if not commission:
+        return None, "Commission record not found for this lead"
+
+    # Check if this milestone already has a payout entry
+    for mp in commission.get("milestone_payouts", []):
+        if mp["milestone_id"] == milestone_id:
+            return commission_helper(commission), None  # already processed
+
+    # Get total contract value to calculate proportional share
+    contract = await db.contracts.find_one({"lead_id": lead_id, "is_deleted": False})
+    total_contract_value = contract["total_value"] if contract else commission["total_contract_value"]
+
+    # Proportional share = (milestone_amount / total_contract_value) * total_commission_calculated
+    if total_contract_value > 0:
+        proportion = milestone_amount / total_contract_value
+    else:
+        proportion = 0
+
+    commission_share = round(proportion * commission["total_commission_calculated"], 2)
+    now = datetime.utcnow()
+    payout_cycle_month = now.strftime("%B-%Y")
+
+    new_payout = {
+        "milestone_id": milestone_id,
+        "milestone_amount": milestone_amount,
+        "commission_share": commission_share,
+        "status": "Pending",
+        "triggered_by_invoice_id": invoice_id,
+        "payout_cycle_month": payout_cycle_month,
+        "reversed_at": None,
+        "cancelled_at": None
+    }
+
+    await db.commissions.update_one(
+        {"lead_id": lead_id},
+        {
+            "$push": {"milestone_payouts": new_payout},
+            "$set": {"updated_at": now}
+        }
+    )
+
+    updated = await db.commissions.find_one({"lead_id": lead_id})
+
+    # Notify Finance Manager and CEO for approval
+    approvers = await db.users.find({"role": {"$in": ["super_admin", "finance_manager"]}}).to_list(20)
+    for approver in approvers:
+        from app.services.notification import create_notification
+        await create_notification(
+            user_id=str(approver["_id"]),
+            message=f"Milestone {milestone_id} received. Commission share of {commission_share} is pending approval for {commission['sales_rep_name']}.",
+            notif_type="commission_status"
+        )
+
+    return commission_helper(updated), None
+
+
+async def approve_milestone_payout(commission_id: str, milestone_id: str, approved_by: str, approver_role: str):
+    """
+    SAL-04: CEO or Finance Manager approves a specific milestone commission payout.
+    Promotes milestone payout status from Pending -> Approved.
+    Only Approved payouts are included in payroll (FIN-03).
+    """
+    if approver_role not in ["super_admin", "finance_manager"]:
+        return None, "Only CEO or Finance Manager can approve commission payouts"
+
+    db = get_db()
+    commission = await db.commissions.find_one({"commission_id": commission_id})
+    if not commission:
+        return None, "Commission not found"
+
+    milestones = commission.get("milestone_payouts", [])
+    found = False
+    for mp in milestones:
+        if mp["milestone_id"] == milestone_id:
+            if mp["status"] != "Pending":
+                return None, f"Milestone payout is already {mp['status']}"
+            mp["status"] = "Approved"
+            found = True
+            break
+
+    if not found:
+        return None, "Milestone payout not found"
+
+    # Check if all milestones approved -> update overall_status
+    all_statuses = [mp["status"] for mp in milestones]
+    overall = "Approved" if all(s in ["Approved", "Paid", "Cancelled"] for s in all_statuses) else "Pending"
+
+    await db.commissions.update_one(
+        {"commission_id": commission_id},
+        {"$set": {
+            "milestone_payouts": milestones,
+            "overall_status": overall,
+            "approved_by": approved_by,
+            "updated_at": datetime.utcnow()
+        }}
+    )
+    updated = await db.commissions.find_one({"commission_id": commission_id})
+
+    # Notify sales rep
+    from app.services.notification import create_notification
+    await create_notification(
+        user_id=commission["sales_rep_id"],
+        message=f"Your commission share of {next((mp['commission_share'] for mp in milestones if mp['milestone_id'] == milestone_id), 0)} for milestone {milestone_id} has been approved.",
+        notif_type="commission_status"
+    )
+
+    return commission_helper(updated), None
+
+
+async def cancel_remaining_commission_payouts(lead_id: str):
+    """
+    SAL-05: Called when a contract is cancelled/terminated.
+    Cancels all Pending milestone commission payouts for that lead.
+    """
+    db = get_db()
+    commission = await db.commissions.find_one({"lead_id": lead_id})
+    if not commission:
+        return None, "Commission not found"
+
+    milestones = commission.get("milestone_payouts", [])
+    now = datetime.utcnow().isoformat()
+    for mp in milestones:
+        if mp["status"] == "Pending":
+            mp["status"] = "Cancelled"
+            mp["cancelled_at"] = now
+
+    await db.commissions.update_one(
+        {"lead_id": lead_id},
+        {"$set": {
+            "milestone_payouts": milestones,
+            "overall_status": "Cancelled",
+            "updated_at": datetime.utcnow()
+        }}
+    )
+    updated = await db.commissions.find_one({"lead_id": lead_id})
+
+    # Notify sales rep
+    from app.services.notification import create_notification
+    await create_notification(
+        user_id=commission["sales_rep_id"],
+        message=f"Contract for lead {lead_id} has been cancelled. All pending commission payouts have been cancelled.",
+        notif_type="commission_status"
+    )
+
+    return commission_helper(updated), None
+
+
+async def reverse_milestone_commission(commission_id: str, milestone_id: str, reversed_by_role: str):
+    """
+    SAL-06: Clawback/Recovery Rule — if a milestone payment is charged back/refunded,
+    the corresponding commission is flagged Reversed and deducted from next payroll.
+    """
+    if reversed_by_role not in ["super_admin", "finance_manager"]:
+        return None, "Only CEO or Finance Manager can reverse a commission"
+
+    db = get_db()
+    commission = await db.commissions.find_one({"commission_id": commission_id})
+    if not commission:
+        return None, "Commission not found"
+
+    milestones = commission.get("milestone_payouts", [])
+    reversed_amount = 0
+    found = False
+    for mp in milestones:
+        if mp["milestone_id"] == milestone_id:
+            if mp["status"] not in ["Approved", "Paid"]:
+                return None, f"Can only reverse Approved or Paid commission payouts"
+            mp["status"] = "Reversed"
+            mp["reversed_at"] = datetime.utcnow().isoformat()
+            reversed_amount = mp["commission_share"]
+            found = True
+            break
+
+    if not found:
+        return None, "Milestone payout not found"
+
+    await db.commissions.update_one(
+        {"commission_id": commission_id},
+        {"$set": {
+            "milestone_payouts": milestones,
+            "overall_status": "Reversed",
+            "updated_at": datetime.utcnow()
+        }}
+    )
+
+    # SAL-06: Deduct reversed amount from sales rep's next payroll via salary deductions
+    if reversed_amount > 0:
+        structure = await db.salary_structures.find_one({"employee_id": commission["sales_rep_id"]})
+        if structure:
+            deductions = structure.get("deductions", {})
+            deductions["other"] = deductions.get("other", 0) + reversed_amount
+            await db.salary_structures.update_one(
+                {"employee_id": commission["sales_rep_id"]},
+                {"$set": {"deductions": deductions, "updated_at": datetime.utcnow()}}
+            )
+
+    updated = await db.commissions.find_one({"commission_id": commission_id})
+
+    # Notify sales rep
+    from app.services.notification import create_notification
+    await create_notification(
+        user_id=commission["sales_rep_id"],
+        message=f"Commission of {reversed_amount} for milestone {milestone_id} has been reversed due to a chargeback. This amount will be deducted from your next payroll.",
+        notif_type="commission_status"
+    )
+
+    return commission_helper(updated), None
+
+
+async def override_commission_rate(commission_id: str, override, updated_by_role: str):
+    """Only HR Manager or CEO can override commission rate per deal."""
     if updated_by_role not in ["super_admin", "hr_manager"]:
         return None, "Only HR Manager or CEO can override commission rate"
 
@@ -95,163 +321,25 @@ async def override_commission_rate(commission_id: str, override: CommissionRateO
     if not commission:
         return None, "Commission not found"
 
-    if commission["status"] in ["Paid"]:
-        return None, "Cannot modify a commission that has already been paid"
+    if commission["overall_status"] in ["Paid"]:
+        return None, "Cannot modify a commission that has already been fully paid"
 
-    new_amount = round(commission["contract_value"] * (override.rate / 100), 2)
+    new_total = round(commission["total_contract_value"] * (override.rate / 100), 2)
 
     await db.commissions.update_one(
         {"commission_id": commission_id},
-        {"$set": {"rate": override.rate, "amount": new_amount, "updated_at": datetime.utcnow()}}
+        {"$set": {
+            "rate": override.rate,
+            "total_commission_calculated": new_total,
+            "updated_at": datetime.utcnow()
+        }}
     )
     updated = await db.commissions.find_one({"commission_id": commission_id})
     return commission_helper(updated), None
 
 
-async def update_commission_status(commission_id: str, status_update: CommissionStatusUpdate, updated_by: str, updated_by_role: str):
-    """
-    Commission Status Lifecycle (SRS 3.3.2):
-    - Pending -> Approved   : CEO or Finance Manager
-    - Approved -> Paid       : Finance Manager marks as paid
-    - Any -> On Hold          : CEO or Finance Manager (dispute/cancellation)
-
-    SAL-06: Sends an in-app notification to the Sales Rep when status changes.
-    """
-    db = get_db()
-    commission = await db.commissions.find_one({"commission_id": commission_id})
-    if not commission:
-        return None, "Commission not found"
-
-    new_status = status_update.status
-    current_status = commission["status"]
-
-    if updated_by_role not in ["super_admin", "finance_manager"]:
-        return None, "Only CEO or Finance Manager can change commission status"
-
-    valid_transitions = {
-        "Pending": ["Approved", "On Hold"],
-        "Approved": ["Paid", "On Hold"],
-        "On Hold": ["Pending", "Approved"],
-        "Paid": []
-    }
-
-    if new_status not in valid_transitions.get(current_status, []):
-        return None, f"Invalid status transition from {current_status} to {new_status}"
-
-    update_data = {
-        "status": new_status,
-        "comments": status_update.comments,
-        "updated_at": datetime.utcnow()
-    }
-
-    if new_status == "Approved":
-        update_data["approved_by"] = updated_by
-    if new_status == "Paid":
-        update_data["paid_date"] = str(date.today())
-
-    await db.commissions.update_one({"commission_id": commission_id}, {"$set": update_data})
-    updated = await db.commissions.find_one({"commission_id": commission_id})
-
-    # SAL-06: Notify the Sales Rep about the status change
-    from app.services.notification import create_notification
-    await create_notification(
-        user_id=commission["sales_rep_id"],
-        message=f"Your commission {commission_id} for lead {commission['lead_id']} status changed from {current_status} to {new_status}.",
-        notif_type="commission_status"
-    )
-
-    return commission_helper(updated), None
-
-
-async def get_all_commissions(status: str = None, sales_rep_id: str = None):
-    db = get_db()
-    query = {}
-    if status:
-        query["status"] = status
-    if sales_rep_id:
-        query["sales_rep_id"] = sales_rep_id
-    commissions = await db.commissions.find(query).sort("created_at", -1).to_list(1000)
-    return [commission_helper(c) for c in commissions]
-
-
-async def get_commission_summary(sales_rep_id: str = None):
-    """
-    Returns commission dashboard summary (SRS 3.4 / 3.5):
-    - Pending vs Approved vs Paid breakdown
-    - Total commission liability (pending + approved unpaid)
-    """
-    db = get_db()
-    query = {}
-    if sales_rep_id:
-        query["sales_rep_id"] = sales_rep_id
-
-    commissions = await db.commissions.find(query).to_list(10000)
-
-    summary = {
-        "total_pending": 0.0,
-        "total_approved": 0.0,
-        "total_paid": 0.0,
-        "total_on_hold": 0.0,
-        "total_liability": 0.0,  # pending + approved unpaid
-        "count_pending": 0,
-        "count_approved": 0,
-        "count_paid": 0,
-        "count_on_hold": 0
-    }
-
-    for c in commissions:
-        amount = c["amount"]
-        status = c["status"]
-        if status == "Pending":
-            summary["total_pending"] += amount
-            summary["count_pending"] += 1
-        elif status == "Approved":
-            summary["total_approved"] += amount
-            summary["count_approved"] += 1
-        elif status == "Paid":
-            summary["total_paid"] += amount
-            summary["count_paid"] += 1
-        elif status == "On Hold":
-            summary["total_on_hold"] += amount
-            summary["count_on_hold"] += 1
-
-    summary["total_liability"] = summary["total_pending"] + summary["total_approved"]
-    return summary
-
-
-async def get_rep_rankings():
-    """Manager/CEO view: all reps ranked by commissions earned (SRS 3.5)."""
-    db = get_db()
-    pipeline = [
-        {"$group": {
-            "_id": "$sales_rep_id",
-            "sales_rep_name": {"$first": "$sales_rep_name"},
-            "total_earned": {"$sum": "$amount"},
-            "total_paid": {
-                "$sum": {"$cond": [{"$eq": ["$status", "Paid"]}, "$amount", 0]}
-            },
-            "deal_count": {"$sum": 1}
-        }},
-        {"$sort": {"total_earned": -1}}
-    ]
-    results = await db.commissions.aggregate(pipeline).to_list(1000)
-    return [
-        {
-            "sales_rep_id": r["_id"],
-            "sales_rep_name": r["sales_rep_name"],
-            "total_earned": r["total_earned"],
-            "total_paid": r["total_paid"],
-            "deal_count": r["deal_count"]
-        }
-        for r in results
-    ]
 async def set_commission_splits(commission_id: str, splits: list, updated_by_role: str):
-    """
-    SAL-04: Support split commission attribution for multi-rep deals.
-    splits: list of CommissionSplit objects (sales_rep_id, sales_rep_name, percentage)
-    Total percentage across splits must equal 100.
-    Only HR Manager or CEO can configure splits.
-    """
+    """SAL multi-rep: split commission attribution."""
     if updated_by_role not in ["super_admin", "hr_manager"]:
         return None, "Only HR Manager or CEO can configure commission splits"
 
@@ -260,18 +348,109 @@ async def set_commission_splits(commission_id: str, splits: list, updated_by_rol
     if not commission:
         return None, "Commission not found"
 
-    if commission["status"] == "Paid":
-        return None, "Cannot modify splits on a commission that has already been paid"
+    if commission["overall_status"] == "Paid":
+        return None, "Cannot modify splits on a fully paid commission"
 
     total_percentage = sum(s.percentage for s in splits)
     if round(total_percentage, 2) != 100.0:
         return None, f"Split percentages must total 100%, got {total_percentage}%"
 
     splits_data = [s.model_dump() for s in splits]
-
     await db.commissions.update_one(
         {"commission_id": commission_id},
         {"$set": {"splits": splits_data, "updated_at": datetime.utcnow()}}
     )
     updated = await db.commissions.find_one({"commission_id": commission_id})
     return commission_helper(updated), None
+
+
+async def get_all_commissions(status: str = None, sales_rep_id: str = None):
+    db = get_db()
+    query = {}
+    if status:
+        query["overall_status"] = status
+    if sales_rep_id:
+        query["sales_rep_id"] = sales_rep_id
+    commissions = await db.commissions.find(query).sort("created_at", -1).to_list(1000)
+    return [commission_helper(c) for c in commissions]
+
+
+async def get_commission_summary(sales_rep_id: str = None):
+    """Commission dashboard summary — pending/approved/paid breakdown."""
+    db = get_db()
+    query = {}
+    if sales_rep_id:
+        query["sales_rep_id"] = sales_rep_id
+
+    commissions = await db.commissions.find(query).to_list(10000)
+
+    summary = {
+        "total_calculated": 0.0,
+        "total_pending": 0.0,
+        "total_approved": 0.0,
+        "total_paid": 0.0,
+        "total_cancelled": 0.0,
+        "total_reversed": 0.0,
+        "total_liability": 0.0
+    }
+
+    for c in commissions:
+        for mp in c.get("milestone_payouts", []):
+            amount = mp["commission_share"]
+            status = mp["status"]
+            if status == "Pending":
+                summary["total_pending"] += amount
+            elif status == "Approved":
+                summary["total_approved"] += amount
+            elif status == "Paid":
+                summary["total_paid"] += amount
+            elif status == "Cancelled":
+                summary["total_cancelled"] += amount
+            elif status == "Reversed":
+                summary["total_reversed"] += amount
+        summary["total_calculated"] += c["total_commission_calculated"]
+
+    summary["total_liability"] = summary["total_pending"] + summary["total_approved"]
+    return summary
+
+
+async def get_rep_rankings():
+    """Manager/CEO view: reps ranked by total commissions earned."""
+    db = get_db()
+    pipeline = [
+        {"$group": {
+            "_id": "$sales_rep_id",
+            "sales_rep_name": {"$first": "$sales_rep_name"},
+            "total_calculated": {"$sum": "$total_commission_calculated"},
+            "deal_count": {"$sum": 1}
+        }},
+        {"$sort": {"total_calculated": -1}}
+    ]
+    results = await db.commissions.aggregate(pipeline).to_list(1000)
+    return [
+        {
+            "sales_rep_id": r["_id"],
+            "sales_rep_name": r["sales_rep_name"],
+            "total_calculated": r["total_calculated"],
+            "deal_count": r["deal_count"]
+        }
+        for r in results
+    ]
+
+
+async def get_approved_commission_totals_by_rep():
+    """
+    FIN-03: Payroll engine uses this to fetch only Approved milestone payouts.
+    Returns dict: {sales_rep_id: total_approved_amount}
+    """
+    db = get_db()
+    commissions = await db.commissions.find({}).to_list(10000)
+
+    totals = {}
+    for c in commissions:
+        rep_id = c["sales_rep_id"]
+        for mp in c.get("milestone_payouts", []):
+            if mp["status"] == "Approved":
+                totals[rep_id] = totals.get(rep_id, 0) + mp["commission_share"]
+
+    return totals

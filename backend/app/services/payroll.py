@@ -29,27 +29,28 @@ async def generate_batch_id(month: int, year: int):
 async def run_monthly_payroll(month: int, year: int, initiated_by: str):
     """
     SRS 4.4.2:
-    - HR Manager initiates payroll at month-end; system compiles all salary records.
-    - System auto-includes approved commissions from the Sales module.
-    - Result is a Draft batch awaiting Finance Manager review.
+    - HR Manager initiates payroll at month-end.
+    - FIN-03: Only Approved milestone commission payouts are included.
+    - Any commission tied to Unpaid/Overdue milestone is completely ignored.
     """
     db = get_db()
 
     batch_id = await generate_batch_id(month, year)
 
     existing = await db.payroll_batches.find_one({"batch_id": batch_id})
-    if existing and existing["status"] != "Draft":
+    if existing and existing["status"] not in ["Draft", "Pending Review"]:
         return None, f"Payroll for {month}/{year} has already been processed (status: {existing['status']})"
 
-    employees = await db.employees.find({"is_deleted": False, "status": "active"}).to_list(1000)
+    employees = await db.employees.find(
+        {"is_deleted": False, "status": "active"}
+    ).to_list(1000)
+
     structures = await db.salary_structures.find({}).to_list(1000)
     structure_map = {s["employee_id"]: s for s in structures}
 
-    # Approved commissions not yet paid, grouped by sales_rep_id (sales reps are in "users", not "employees")
-    commissions = await db.commissions.find({"status": "Approved"}).to_list(10000)
-    commission_map = {}
-    for c in commissions:
-        commission_map[c["sales_rep_id"]] = commission_map.get(c["sales_rep_id"], 0) + c["amount"]
+    # FIN-03: Only fetch Approved milestone commission payouts (never Pending/Overdue)
+    from app.services.commission import get_approved_commission_totals_by_rep
+    commission_map = await get_approved_commission_totals_by_rep()
 
     records = []
     total_gross = 0.0
@@ -59,21 +60,21 @@ async def run_monthly_payroll(month: int, year: int, initiated_by: str):
     for emp in employees:
         structure = structure_map.get(emp["employee_id"])
         if not structure:
-            continue  # skip employees without a configured salary structure
+            continue
 
         basic = structure["basic_salary"]
         allowances = structure.get("allowances", {})
         deductions = structure.get("deductions", {})
 
-        allowances_total = sum(allowances.values())
-        deductions_total = sum(deductions.values())
+        allowances_total = round(sum(allowances.values()), 2)
+        deductions_total = round(sum(deductions.values()), 2)
 
-        # commission only applies if this employee's linked user account is a sales rep
-        commission_amount = commission_map.get(emp["employee_id"], 0.0)
+        # FIN-03: commission_map only contains Approved payouts
+        commission_amount = round(commission_map.get(emp["employee_id"], 0.0), 2)
         bonus = 0.0
 
-        gross_pay = basic + allowances_total + commission_amount + bonus
-        net_pay = gross_pay - deductions_total
+        gross_pay = round(basic + allowances_total + commission_amount + bonus, 2)
+        net_pay = round(gross_pay - deductions_total, 2)
 
         records.append({
             "employee_id": emp["employee_id"],
@@ -110,7 +111,7 @@ async def run_monthly_payroll(month: int, year: int, initiated_by: str):
     }
 
     if existing:
-        await db.payroll_batches.update_one({"batch_id": batch_id}, {"$set": batch})
+        await db.payroll_batches.replace_one({"batch_id": batch_id}, batch)
     else:
         await db.payroll_batches.insert_one(batch)
 
@@ -119,7 +120,7 @@ async def run_monthly_payroll(month: int, year: int, initiated_by: str):
 
 
 async def review_payroll_batch(batch_id: str, reviewed_by: str, reviewer_role: str):
-    """Finance Manager reviews the payroll summary and submits for CEO approval."""
+    """Finance Manager reviews payroll summary and submits for CEO approval (SRS 4.4.2)."""
     if reviewer_role not in ["super_admin", "finance_manager"]:
         return None, "Only Finance Manager or CEO can review payroll"
 
@@ -133,7 +134,10 @@ async def review_payroll_batch(batch_id: str, reviewed_by: str, reviewer_role: s
 
     await db.payroll_batches.update_one(
         {"batch_id": batch_id},
-        {"$set": {"status": "Pending Approval", "reviewed_by": reviewed_by}}
+        {"$set": {
+            "status": "Pending Approval",
+            "reviewed_by": reviewed_by
+        }}
     )
     updated = await db.payroll_batches.find_one({"batch_id": batch_id})
     return payroll_batch_helper(updated), None
@@ -141,8 +145,10 @@ async def review_payroll_batch(batch_id: str, reviewed_by: str, reviewer_role: s
 
 async def approve_payroll_batch(batch_id: str, approved_by: str, approver_role: str):
     """
-    CEO approves payroll; system marks salaries as Paid and triggers
-    payslip generation (SRS 4.4.2 / 7.2).
+    SRS 4.4.2 / 7.2: CEO approves payroll.
+    - Marks included Approved commission milestone payouts as Paid.
+    - Triggers payslip generation for all employees.
+    - Marks batch as Paid.
     """
     if approver_role != "super_admin":
         return None, "Only the CEO can approve payroll"
@@ -164,23 +170,60 @@ async def approve_payroll_batch(batch_id: str, approved_by: str, approver_role: 
         }}
     )
 
-    # Mark approved commissions as Paid (they were included in this payroll)
-    await db.commissions.update_many(
-        {"status": "Approved"},
-        {"$set": {"status": "Paid", "paid_date": datetime.utcnow().strftime("%Y-%m-%d")}}
-    )
+    # Mark included Approved milestone payouts as Paid
+    await _mark_commission_payouts_paid(batch)
 
-    updated = await db.payroll_batches.find_one({"batch_id": batch_id})
-
-    # Trigger payslip generation for all records (Step 27)
+    # Generate payslips for all employees in this batch
     from app.services.payslip import generate_payslips_for_batch
     await generate_payslips_for_batch(batch_id)
 
-    # Update final status to Paid after payslips generated
-    await db.payroll_batches.update_one({"batch_id": batch_id}, {"$set": {"status": "Paid"}})
-    updated = await db.payroll_batches.find_one({"batch_id": batch_id})
+    # Final status: Paid
+    await db.payroll_batches.update_one(
+        {"batch_id": batch_id},
+        {"$set": {"status": "Paid"}}
+    )
 
+    updated = await db.payroll_batches.find_one({"batch_id": batch_id})
     return payroll_batch_helper(updated), None
+
+
+async def _mark_commission_payouts_paid(batch: dict):
+    """
+    After CEO approval, marks all Approved milestone commission payouts as Paid
+    for employees included in this payroll batch.
+    """
+    db = get_db()
+    employee_ids_in_batch = {r["employee_id"] for r in batch.get("records", []) if r["commission_amount"] > 0}
+    if not employee_ids_in_batch:
+        return
+
+    commissions = await db.commissions.find(
+        {"sales_rep_id": {"$in": list(employee_ids_in_batch)}}
+    ).to_list(1000)
+
+    now_str = datetime.utcnow().strftime("%Y-%m-%d")
+    payout_cycle = f"{batch['month']:02d}-{batch['year']}"
+
+    for commission in commissions:
+        milestones = commission.get("milestone_payouts", [])
+        changed = False
+        for mp in milestones:
+            if mp["status"] == "Approved":
+                mp["status"] = "Paid"
+                mp["payout_cycle_month"] = payout_cycle
+                changed = True
+
+        if changed:
+            all_statuses = [mp["status"] for mp in milestones]
+            overall = "Paid" if all(s in ["Paid", "Cancelled", "Reversed"] for s in all_statuses) else "Approved"
+            await db.commissions.update_one(
+                {"commission_id": commission["commission_id"]},
+                {"$set": {
+                    "milestone_payouts": milestones,
+                    "overall_status": overall,
+                    "updated_at": datetime.utcnow()
+                }}
+            )
 
 
 async def get_payroll_batch(batch_id: str):
@@ -198,7 +241,7 @@ async def get_all_payroll_batches():
 
 
 async def get_payroll_summary_report(year: int = None):
-    """FIN: Payroll Summary report — total salary cost, commissions, deductions per month."""
+    """FIN: Payroll Summary — total salary cost, commissions, deductions per month."""
     db = get_db()
     query = {"status": "Paid"}
     if year:
