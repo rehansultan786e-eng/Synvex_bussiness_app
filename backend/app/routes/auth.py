@@ -2,21 +2,18 @@
 #
 # Authentication routes.
 #
+# SRS 9.1: Login for super_admin and finance_manager now requires 2FA
+# (email OTP). Flow:
+#   1. POST /login -> if 2FA required, returns {"requires_2fa": true, "temp_token": ...}
+#                      (no access/refresh tokens yet)
+#                   -> if 2FA not required, returns normal TokenResponse directly
+#   2. POST /verify-2fa -> temp_token + otp -> returns TokenResponse
+#   3. POST /resend-2fa -> temp_token -> resends OTP (rate-limited)
+#
 # Invite permission rules (who can invite whom):
 # - super_admin (CEO)   -> can invite anyone: hr_manager, finance_manager,
 #                          sales_manager, sales_rep
-# - hr_manager           -> can invite: sales_rep (rare) - mainly manages employees
-#                          via the employee module (separate from user invites)
 # - sales_manager        -> can invite: sales_rep
-#
-# - /login            : manager-level login (super_admin, hr_manager,
-#                        finance_manager, sales_manager, sales_rep)
-# - /employee-login   : employee login (unchanged)
-# - /me               : returns current logged-in user info
-# - /invite-user      : invite a new manager/rep user
-# - /set-password     : activate account via invite link
-# - /resend-invite    : resend invite email
-# - /users            : list users
 
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -25,6 +22,7 @@ from app.models.user import (
     InviteUserRequest, InviteUserResponse,
     SetPasswordRequest, ResendInviteRequest
 )
+from app.models.two_factor import TwoFactorVerifyRequest, TwoFactorResendRequest
 from app.database.connection import get_db
 from app.utils.auth import hash_password, verify_password, create_access_token, create_refresh_token, verify_token
 from app.utils.dependencies import get_current_user
@@ -32,6 +30,11 @@ from app.services.user import (
     create_invited_user, set_user_password_via_invite,
     resend_invite, get_all_users, get_user_by_email
 )
+from app.services.two_factor import (
+    create_2fa_challenge, verify_otp, resend_otp, requires_2fa
+)
+from app.models.password_reset import ForgotPasswordRequest, ResetPasswordRequest
+from app.services.password_reset import request_password_reset, reset_password_with_token
 from datetime import datetime
 from pydantic import BaseModel
 
@@ -43,9 +46,9 @@ class EmployeeLoginRequest(BaseModel):
     password: str
 
 
-# ===== LOGIN =====
+# ===== LOGIN (2FA-aware) =====
 
-@router.post("/login", response_model=TokenResponse)
+@router.post("/login")
 async def login(credentials: UserLogin):
     db = get_db()
     user = await db.users.find_one({"email": credentials.email})
@@ -59,15 +62,53 @@ async def login(credentials: UserLogin):
             detail="Account not activated. Please check your email to set your password."
         )
 
+    role = user["role"]
+
+    if requires_2fa(role):
+        temp_token = await create_2fa_challenge(str(user["_id"]), user["email"], role)
+        return {
+            "requires_2fa": True,
+            "temp_token": temp_token,
+            "message": "A verification code has been sent to your email."
+        }
+
     token_data = {
         "user_id": str(user["_id"]),
         "email": user["email"],
-        "role": user["role"]
+        "role": role
+    }
+    return {
+        "requires_2fa": False,
+        "access_token": create_access_token(token_data),
+        "refresh_token": create_refresh_token(token_data),
+        "token_type": "bearer"
+    }
+
+
+@router.post("/verify-2fa", response_model=TokenResponse)
+async def verify_2fa_route(request: TwoFactorVerifyRequest):
+    """SRS 9.1: Completes login for super_admin/finance_manager after OTP verification."""
+    user_payload, error = await verify_otp(request.temp_token, request.otp)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+
+    token_data = {
+        "user_id": user_payload["user_id"],
+        "email": user_payload["email"],
+        "role": user_payload["role"]
     }
     return TokenResponse(
         access_token=create_access_token(token_data),
         refresh_token=create_refresh_token(token_data)
     )
+
+
+@router.post("/resend-2fa")
+async def resend_2fa_route(request: TwoFactorResendRequest):
+    new_temp_token, error = await resend_otp(request.temp_token)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    return {"temp_token": new_temp_token, "message": "A new verification code has been sent to your email."}
 
 
 # ===== EMPLOYEE LOGIN (unchanged) =====
@@ -147,16 +188,10 @@ async def get_me(credentials: HTTPAuthorizationCredentials = Depends(security)):
 
 @router.post("/invite-user", response_model=InviteUserResponse)
 async def invite_user(request: InviteUserRequest, current_user=Depends(get_current_user)):
-    """
-    Permission rules:
-    - super_admin (CEO) can invite: hr_manager, finance_manager, sales_manager, sales_rep
-    - sales_manager can invite: sales_rep only
-    - hr_manager / finance_manager / sales_rep cannot invite anyone
-    """
     requester_role = current_user.get("role")
 
     if requester_role == "super_admin":
-        pass  # can invite any role
+        pass
     elif requester_role == "sales_manager":
         if request.role != "sales_rep":
             raise HTTPException(status_code=403, detail="Sales Manager can only invite Sales Reps")
@@ -213,11 +248,6 @@ async def resend_invite_route(request: ResendInviteRequest, current_user=Depends
 
 @router.get("/users")
 async def list_users(current_user=Depends(get_current_user)):
-    """
-    super_admin: sees all manager/rep users
-    sales_manager: sees sales_rep users only
-    others: forbidden
-    """
     role = current_user.get("role")
 
     if role == "super_admin":
@@ -229,3 +259,18 @@ async def list_users(current_user=Depends(get_current_user)):
         return {"users": await get_all_users("sales_rep")}
     else:
         raise HTTPException(status_code=403, detail="You do not have permission to view users")
+    
+    # ===== PASSWORD RESET (SRS 9.1) =====
+
+@router.post("/forgot-password")
+async def forgot_password(request: ForgotPasswordRequest):
+    await request_password_reset(request.email)
+    return {"message": "If an account exists with this email, a password reset link has been sent."}
+
+
+@router.post("/reset-password")
+async def reset_password(request: ResetPasswordRequest):
+    success, error = await reset_password_with_token(request.token, request.new_password)
+    if not success:
+        raise HTTPException(status_code=400, detail=error)
+    return {"message": "Password reset successfully. You can now log in with your new password."}

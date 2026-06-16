@@ -17,6 +17,14 @@ from app.routes.analytics import router as analytics_router
 from app.routes.settings import router as settings_router
 from app.routes.ip_settings import router as ip_settings_router
 from app.routes.sales import router as sales_router
+from app.routes.finance import router as finance_router
+from app.routes.expense import router as expense_router
+from app.routes.payroll import router as payroll_router
+from app.routes.reports import router as reports_router
+from app.routes.assets import router as assets_router
+from app.routes.performance import router as performance_router
+from app.routes.offboarding import router as offboarding_router
+from app.routes.audit_log import router as audit_log_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -25,6 +33,7 @@ async def lifespan(app: FastAPI):
     preload_model()
     yield
     await disconnect_db()
+
 import logging
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
@@ -43,7 +52,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Routes
 app.include_router(auth_router)
 app.include_router(employee_router)
 app.include_router(department_router)
@@ -55,6 +63,14 @@ app.include_router(analytics_router)
 app.include_router(settings_router)
 app.include_router(ip_settings_router)
 app.include_router(sales_router)
+app.include_router(finance_router)
+app.include_router(expense_router)
+app.include_router(payroll_router)
+app.include_router(reports_router)
+app.include_router(assets_router)
+app.include_router(performance_router)
+app.include_router(offboarding_router)
+app.include_router(audit_log_router)
 
 @app.get("/")
 async def root():
