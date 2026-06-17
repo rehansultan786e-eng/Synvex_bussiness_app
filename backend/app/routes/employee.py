@@ -27,7 +27,13 @@ async def create_new_employee(
     employee_data: EmployeeCreate,
     admin=Depends(get_current_hr)
 ):
-    employee, error = await create_employee(employee_data)
+    # Pass the authenticated HR user details down as the actor metadata parameters
+    employee, error = await create_employee(
+        employee_data,
+        actor_id=admin.get("user_id", "system"),
+        actor_name=admin.get("full_name", "System Automated"),
+        actor_role=admin.get("role", "system")
+    )
     if error:
         raise HTTPException(status_code=400, detail=error)
     return {"message": "Employee created successfully", "data": employee}
@@ -58,7 +64,14 @@ async def update_existing_employee(
     employee_data: EmployeeUpdate,
     admin=Depends(get_current_hr)
 ):
-    employee = await update_employee(employee_id, employee_data)
+    # Pass the authenticated HR user details down as the actor metadata parameters
+    employee = await update_employee(
+        employee_id, 
+        employee_data,
+        actor_id=admin.get("user_id", "system"),
+        actor_name=admin.get("full_name", "System Automated"),
+        actor_role=admin.get("role", "system")
+    )
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
     return {"message": "Employee updated successfully", "data": employee}
@@ -69,7 +82,14 @@ async def delete_existing_employee(employee_id: str, admin=Depends(get_current_h
     employee = await get_employee_by_id(employee_id)
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
-    await delete_employee(employee_id)
+    
+    # Pass the authenticated HR user details down as the actor metadata parameters
+    await delete_employee(
+        employee_id,
+        actor_id=admin.get("user_id", "system"),
+        actor_name=admin.get("full_name", "System Automated"),
+        actor_role=admin.get("role", "system")
+    )
     return {"message": "Employee deleted successfully"}
 
 
@@ -81,7 +101,14 @@ async def update_employee_onboarding(
     checklist: OnboardingChecklistUpdate,
     admin=Depends(get_current_hr)
 ):
-    employee = await update_onboarding_checklist(employee_id, checklist)
+    # Pass the authenticated HR user details down as the actor metadata parameters
+    employee = await update_onboarding_checklist(
+        employee_id, 
+        checklist,
+        actor_id=admin.get("user_id", "system"),
+        actor_name=admin.get("full_name", "System Automated"),
+        actor_role=admin.get("role", "system")
+    )
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
     return {"message": "Onboarding checklist updated", "data": employee}

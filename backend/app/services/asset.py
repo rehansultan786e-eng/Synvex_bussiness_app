@@ -4,6 +4,7 @@ from app.models.asset import (
     AssetReturnRequest, AssetTransferRequest,
     MaintenanceLogRequest
 )
+from app.services.audit_log import log_action
 from datetime import datetime, date
 from bson import ObjectId
 
@@ -60,7 +61,12 @@ async def generate_asset_id():
     return f"AST-{count + 1:05d}"
 
 
-async def create_asset(asset_data: AssetCreate, created_by: str):
+async def create_asset(
+    asset_data: AssetCreate, 
+    created_by: str,
+    actor_name: str = "System Automated",
+    actor_role: str = "admin"
+):
     db = get_db()
 
     # Serial number must be unique
@@ -98,7 +104,22 @@ async def create_asset(asset_data: AssetCreate, created_by: str):
 
     result = await db.assets.insert_one(asset)
     new_asset = await db.assets.find_one({"_id": result.inserted_id})
-    return asset_helper(new_asset), None
+    payload = asset_helper(new_asset)
+
+    # Log Asset Creation
+    await log_action(
+        user_id=created_by,
+        user_name=actor_name,
+        user_role=actor_role,
+        action="CREATE",
+        entity="asset",
+        entity_id=asset_id,
+        old_value=None,
+        new_value=payload,
+        description=f"Created corporate asset '{asset_data.name}' ({asset_id}) under category '{asset_data.category}'."
+    )
+
+    return payload, None
 
 
 async def get_all_assets(
@@ -136,17 +157,49 @@ async def get_asset_by_id(asset_id: str):
     return None
 
 
-async def update_asset(asset_id: str, asset_data: AssetUpdate):
+async def update_asset(
+    asset_id: str, 
+    asset_data: AssetUpdate,
+    actor_id: str = "system",
+    actor_name: str = "System Automated",
+    actor_role: str = "admin"
+):
     db = get_db()
+    old_asset = await db.assets.find_one({"asset_id": asset_id})
+    if not old_asset:
+        return None
+    old_payload = asset_helper(old_asset)
+
     update_data = {k: v for k, v in asset_data.model_dump().items() if v is not None}
     if "warranty_expiry_date" in update_data:
         update_data["warranty_expiry_date"] = str(update_data["warranty_expiry_date"])
     update_data["updated_at"] = datetime.utcnow()
+    
     await db.assets.update_one({"asset_id": asset_id}, {"$set": update_data})
-    return await get_asset_by_id(asset_id)
+    updated = await get_asset_by_id(asset_id)
+
+    if updated:
+        await log_action(
+            user_id=actor_id,
+            user_name=actor_name,
+            user_role=actor_role,
+            action="UPDATE",
+            entity="asset",
+            entity_id=asset_id,
+            old_value=old_payload,
+            new_value=updated,
+            description=f"Updated core details for asset {asset_id}."
+        )
+    return updated
 
 
-async def assign_asset(asset_id: str, request: AssetAssignRequest):
+async def assign_asset(
+    asset_id: str, 
+    request: AssetAssignRequest,
+    actor_id: str = "system",
+    actor_name: str = "System Automated",
+    actor_role: str = "admin"
+):
     """
     AST-02: Assign asset to an employee.
     Asset must be Available. Sends notification to employee.
@@ -157,6 +210,8 @@ async def assign_asset(asset_id: str, request: AssetAssignRequest):
         return None, "Asset not found"
     if asset["status"] != "Available":
         return None, f"Asset is currently {asset['status']} and cannot be assigned"
+
+    old_payload = asset_helper(asset)
 
     employee = await db.employees.find_one({
         "employee_id": request.employee_id,
@@ -205,10 +260,25 @@ async def assign_asset(asset_id: str, request: AssetAssignRequest):
     )
 
     updated = await db.assets.find_one({"asset_id": asset_id})
-    return asset_helper(updated), None
+    new_payload = asset_helper(updated)
+
+    # Log Asset Assignment
+    await log_action(
+        user_id=actor_id,
+        user_name=actor_name,
+        user_role=actor_role,
+        action="UPDATE_STATUS",
+        entity="asset",
+        entity_id=asset_id,
+        old_value=old_payload,
+        new_value=new_payload,
+        description=f"Assigned asset {asset_id} to employee {employee['full_name']} ({request.employee_id})."
+    )
+
+    return new_payload, None
 
 
-async def acknowledge_asset(asset_id: str, employee_id: str):
+async def acknowledge_asset(asset_id: str, employee_id: str, actor_name: str = "Employee"):
     """
     AST-02: Employee digitally acknowledges receipt of assigned asset.
     """
@@ -218,6 +288,8 @@ async def acknowledge_asset(asset_id: str, employee_id: str):
         return None, "Asset not found"
     if asset.get("assigned_to") != employee_id:
         return None, "This asset is not assigned to you"
+
+    old_payload = asset_helper(asset)
 
     # Update current assignment record in history
     history = asset.get("assignment_history", [])
@@ -237,10 +309,31 @@ async def acknowledge_asset(asset_id: str, employee_id: str):
     )
 
     updated = await db.assets.find_one({"asset_id": asset_id})
-    return asset_helper(updated), None
+    new_payload = asset_helper(updated)
+
+    # Log Asset Acknowledgment
+    await log_action(
+        user_id=employee_id,
+        user_name=actor_name,
+        user_role="employee",
+        action="UPDATE_STATUS",
+        entity="asset",
+        entity_id=asset_id,
+        old_value=old_payload,
+        new_value=new_payload,
+        description=f"Employee {actor_name} digitally acknowledged receipt of asset {asset_id}."
+    )
+
+    return new_payload, None
 
 
-async def return_asset(asset_id: str, request: AssetReturnRequest):
+async def return_asset(
+    asset_id: str, 
+    request: AssetReturnRequest,
+    actor_id: str = "system",
+    actor_name: str = "System Automated",
+    actor_role: str = "admin"
+):
     """
     AST-03: Mark asset as returned.
     AST-04: Flag if condition on return is worse than on assignment.
@@ -251,6 +344,8 @@ async def return_asset(asset_id: str, request: AssetReturnRequest):
         return None, "Asset not found"
     if asset["status"] != "Assigned":
         return None, "Asset is not currently assigned"
+
+    old_payload = asset_helper(asset)
 
     condition_degraded = False
     condition_order = ["New", "Good", "Fair", "Damaged"]
@@ -290,10 +385,32 @@ async def return_asset(asset_id: str, request: AssetReturnRequest):
     )
 
     updated = await db.assets.find_one({"asset_id": asset_id})
-    return asset_helper(updated), ("CONDITION_DEGRADED" if condition_degraded else None)
+    new_payload = asset_helper(updated)
+
+    # Log Asset Return Action
+    degraded_text = " with condition DEGRADATION flag" if condition_degraded else ""
+    await log_action(
+        user_id=actor_id,
+        user_name=actor_name,
+        user_role=actor_role,
+        action="UPDATE_STATUS",
+        entity="asset",
+        entity_id=asset_id,
+        old_value=old_payload,
+        new_value=new_payload,
+        description=f"Processed asset return for {asset_id}{degraded_text}. Status reset to Available."
+    )
+
+    return new_payload, ("CONDITION_DEGRADED" if condition_degraded else None)
 
 
-async def transfer_asset(asset_id: str, request: AssetTransferRequest):
+async def transfer_asset(
+    asset_id: str, 
+    request: AssetTransferRequest,
+    actor_id: str = "system",
+    actor_name: str = "System Automated",
+    actor_role: str = "admin"
+):
     """
     AST-03: Transfer asset directly between employees.
     Closes current assignment and opens a new one.
@@ -304,6 +421,8 @@ async def transfer_asset(asset_id: str, request: AssetTransferRequest):
         return None, "Asset not found"
     if asset["status"] != "Assigned":
         return None, "Asset must be currently assigned to transfer"
+
+    old_payload = asset_helper(asset)
 
     to_employee = await db.employees.find_one({
         "employee_id": request.to_employee_id,
@@ -362,15 +481,38 @@ async def transfer_asset(asset_id: str, request: AssetTransferRequest):
     )
 
     updated = await db.assets.find_one({"asset_id": asset_id})
-    return asset_helper(updated), None
+    new_payload = asset_helper(updated)
+
+    # Log Asset Transfer Action
+    await log_action(
+        user_id=actor_id,
+        user_name=actor_name,
+        user_role=actor_role,
+        action="UPDATE_STATUS",
+        entity="asset",
+        entity_id=asset_id,
+        old_value=old_payload,
+        new_value=new_payload,
+        description=f"Transferred asset {asset_id} ownership directly to employee {to_employee['full_name']}."
+    )
+
+    return new_payload, None
 
 
-async def log_maintenance(asset_id: str, maintenance_data: MaintenanceLogRequest):
+async def log_maintenance(
+    asset_id: str, 
+    maintenance_data: MaintenanceLogRequest,
+    actor_id: str = "system",
+    actor_name: str = "System Automated",
+    actor_role: str = "admin"
+):
     """AST-05: Log a maintenance record against an asset."""
     db = get_db()
     asset = await db.assets.find_one({"asset_id": asset_id})
     if not asset:
         return None, "Asset not found"
+
+    old_payload = asset_helper(asset)
 
     record = {
         "date": str(maintenance_data.date),
@@ -393,25 +535,67 @@ async def log_maintenance(asset_id: str, maintenance_data: MaintenanceLogRequest
     )
 
     updated = await db.assets.find_one({"asset_id": asset_id})
-    return asset_helper(updated), None
+    new_payload = asset_helper(updated)
+
+    # Log Maintenance Activity
+    await log_action(
+        user_id=actor_id,
+        user_name=actor_name,
+        user_role=actor_role,
+        action="UPDATE_STATUS",
+        entity="asset",
+        entity_id=asset_id,
+        old_value=old_payload,
+        new_value=new_payload,
+        description=f"Logged maintenance ticket for asset {asset_id}. Cost: {maintenance_data.cost}. Status shifted to 'Under Maintenance'."
+    )
+
+    return new_payload, None
 
 
-async def complete_maintenance(asset_id: str):
+async def complete_maintenance(
+    asset_id: str,
+    actor_id: str = "system",
+    actor_name: str = "System Automated",
+    actor_role: str = "admin"
+):
     """Mark asset as Available after maintenance is complete."""
     db = get_db()
     asset = await db.assets.find_one({"asset_id": asset_id})
     if not asset:
         return None, "Asset not found"
 
+    old_payload = asset_helper(asset)
+
     await db.assets.update_one(
         {"asset_id": asset_id},
         {"$set": {"status": "Available", "updated_at": datetime.utcnow()}}
     )
     updated = await db.assets.find_one({"asset_id": asset_id})
-    return asset_helper(updated), None
+    new_payload = asset_helper(updated)
+
+    # Log Maintenance Resolution
+    await log_action(
+        user_id=actor_id,
+        user_name=actor_name,
+        user_role=actor_role,
+        action="UPDATE_STATUS",
+        entity="asset",
+        entity_id=asset_id,
+        old_value=old_payload,
+        new_value=new_payload,
+        description=f"Resolved maintenance for asset {asset_id}. Returned to Available status pool."
+    )
+
+    return new_payload, None
 
 
-async def dispose_asset(asset_id: str):
+async def dispose_asset(
+    asset_id: str,
+    actor_id: str = "system",
+    actor_name: str = "System Automated",
+    actor_role: str = "admin"
+):
     """Mark asset as Disposed (end of life)."""
     db = get_db()
     asset = await db.assets.find_one({"asset_id": asset_id})
@@ -420,12 +604,29 @@ async def dispose_asset(asset_id: str):
     if asset["status"] == "Assigned":
         return None, "Cannot dispose an asset that is currently assigned"
 
+    old_payload = asset_helper(asset)
+
     await db.assets.update_one(
         {"asset_id": asset_id},
         {"$set": {"status": "Disposed", "updated_at": datetime.utcnow()}}
     )
     updated = await db.assets.find_one({"asset_id": asset_id})
-    return asset_helper(updated), None
+    new_payload = asset_helper(updated)
+
+    # Log Asset Disposal
+    await log_action(
+        user_id=actor_id,
+        user_name=actor_name,
+        user_role=actor_role,
+        action="UPDATE_STATUS",
+        entity="asset",
+        entity_id=asset_id,
+        old_value=old_payload,
+        new_value=new_payload,
+        description=f"Asset {asset_id} has been permanently decommissioned / disposed."
+    )
+
+    return new_payload, None
 
 
 async def get_warranty_expiring_soon(days: int = 30):

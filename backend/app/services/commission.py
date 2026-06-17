@@ -1,5 +1,6 @@
 from app.database.connection import get_db
 from app.models.commission import CommissionCreate, CommissionRateOverride, CommissionSplitsRequest, MilestonePayoutApproval
+from app.services.audit_log import log_action
 from datetime import datetime, date
 
 
@@ -105,16 +106,13 @@ async def trigger_milestone_commission(lead_id: str, milestone_id: str, mileston
     if not commission:
         return None, "Commission record not found for this lead"
 
-    # Check if this milestone already has a payout entry
     for mp in commission.get("milestone_payouts", []):
         if mp["milestone_id"] == milestone_id:
-            return commission_helper(commission), None  # already processed
+            return commission_helper(commission), None
 
-    # Get total contract value to calculate proportional share
     contract = await db.contracts.find_one({"lead_id": lead_id, "is_deleted": False})
     total_contract_value = contract["total_value"] if contract else commission["total_contract_value"]
 
-    # Proportional share = (milestone_amount / total_contract_value) * total_commission_calculated
     if total_contract_value > 0:
         proportion = milestone_amount / total_contract_value
     else:
@@ -145,7 +143,6 @@ async def trigger_milestone_commission(lead_id: str, milestone_id: str, mileston
 
     updated = await db.commissions.find_one({"lead_id": lead_id})
 
-    # Notify Finance Manager and CEO for approval
     approvers = await db.users.find({"role": {"$in": ["super_admin", "finance_manager"]}}).to_list(20)
     for approver in approvers:
         from app.services.notification import create_notification
@@ -158,11 +155,15 @@ async def trigger_milestone_commission(lead_id: str, milestone_id: str, mileston
     return commission_helper(updated), None
 
 
-async def approve_milestone_payout(commission_id: str, milestone_id: str, approved_by: str, approver_role: str):
+async def approve_milestone_payout(
+    commission_id: str, 
+    milestone_id: str, 
+    approved_by: str, 
+    approver_role: str,
+    actor_name: str = "System Automated"
+):
     """
     SAL-04: CEO or Finance Manager approves a specific milestone commission payout.
-    Promotes milestone payout status from Pending -> Approved.
-    Only Approved payouts are included in payroll (FIN-03).
     """
     if approver_role not in ["super_admin", "finance_manager"]:
         return None, "Only CEO or Finance Manager can approve commission payouts"
@@ -171,6 +172,8 @@ async def approve_milestone_payout(commission_id: str, milestone_id: str, approv
     commission = await db.commissions.find_one({"commission_id": commission_id})
     if not commission:
         return None, "Commission not found"
+        
+    old_payload = commission_helper(commission)
 
     milestones = commission.get("milestone_payouts", [])
     found = False
@@ -185,7 +188,6 @@ async def approve_milestone_payout(commission_id: str, milestone_id: str, approv
     if not found:
         return None, "Milestone payout not found"
 
-    # Check if all milestones approved -> update overall_status
     all_statuses = [mp["status"] for mp in milestones]
     overall = "Approved" if all(s in ["Approved", "Paid", "Cancelled"] for s in all_statuses) else "Pending"
 
@@ -200,12 +202,24 @@ async def approve_milestone_payout(commission_id: str, milestone_id: str, approv
     )
     updated = await db.commissions.find_one({"commission_id": commission_id})
 
-    # Notify sales rep
     from app.services.notification import create_notification
     await create_notification(
         user_id=commission["sales_rep_id"],
         message=f"Your commission share of {next((mp['commission_share'] for mp in milestones if mp['milestone_id'] == milestone_id), 0)} for milestone {milestone_id} has been approved.",
         notif_type="commission_status"
+    )
+
+    # Trigger Audit Log
+    await log_action(
+        user_id=approved_by,
+        user_name=actor_name,
+        user_role=approver_role,
+        action="UPDATE",
+        entity="commission_milestone",
+        entity_id=commission_id,
+        old_value=old_payload,
+        new_value=commission_helper(updated),
+        description=f"Approved milestone payout {milestone_id} for commission ledger {commission_id}."
     )
 
     return commission_helper(updated), None
@@ -214,7 +228,6 @@ async def approve_milestone_payout(commission_id: str, milestone_id: str, approv
 async def cancel_remaining_commission_payouts(lead_id: str):
     """
     SAL-05: Called when a contract is cancelled/terminated.
-    Cancels all Pending milestone commission payouts for that lead.
     """
     db = get_db()
     commission = await db.commissions.find_one({"lead_id": lead_id})
@@ -238,7 +251,6 @@ async def cancel_remaining_commission_payouts(lead_id: str):
     )
     updated = await db.commissions.find_one({"lead_id": lead_id})
 
-    # Notify sales rep
     from app.services.notification import create_notification
     await create_notification(
         user_id=commission["sales_rep_id"],
@@ -249,10 +261,15 @@ async def cancel_remaining_commission_payouts(lead_id: str):
     return commission_helper(updated), None
 
 
-async def reverse_milestone_commission(commission_id: str, milestone_id: str, reversed_by_role: str):
+async def reverse_milestone_commission(
+    commission_id: str, 
+    milestone_id: str, 
+    reversed_by_role: str,
+    actor_id: str = "system",
+    actor_name: str = "System Automated"
+):
     """
-    SAL-06: Clawback/Recovery Rule — if a milestone payment is charged back/refunded,
-    the corresponding commission is flagged Reversed and deducted from next payroll.
+    SAL-06: Clawback/Recovery Rule — deducts from next payroll.
     """
     if reversed_by_role not in ["super_admin", "finance_manager"]:
         return None, "Only CEO or Finance Manager can reverse a commission"
@@ -262,6 +279,7 @@ async def reverse_milestone_commission(commission_id: str, milestone_id: str, re
     if not commission:
         return None, "Commission not found"
 
+    old_payload = commission_helper(commission)
     milestones = commission.get("milestone_payouts", [])
     reversed_amount = 0
     found = False
@@ -287,7 +305,6 @@ async def reverse_milestone_commission(commission_id: str, milestone_id: str, re
         }}
     )
 
-    # SAL-06: Deduct reversed amount from sales rep's next payroll via salary deductions
     if reversed_amount > 0:
         structure = await db.salary_structures.find_one({"employee_id": commission["sales_rep_id"]})
         if structure:
@@ -300,7 +317,6 @@ async def reverse_milestone_commission(commission_id: str, milestone_id: str, re
 
     updated = await db.commissions.find_one({"commission_id": commission_id})
 
-    # Notify sales rep
     from app.services.notification import create_notification
     await create_notification(
         user_id=commission["sales_rep_id"],
@@ -308,10 +324,29 @@ async def reverse_milestone_commission(commission_id: str, milestone_id: str, re
         notif_type="commission_status"
     )
 
+    # Trigger Audit Log
+    await log_action(
+        user_id=actor_id,
+        user_name=actor_name,
+        user_role=reversed_by_role,
+        action="REVERSE",
+        entity="commission_milestone",
+        entity_id=commission_id,
+        old_value=old_payload,
+        new_value=commission_helper(updated),
+        description=f"Clawback applied: Reversed milestone payout {milestone_id} for commission {commission_id}. Deducted {reversed_amount} from rep payroll structure."
+    )
+
     return commission_helper(updated), None
 
 
-async def override_commission_rate(commission_id: str, override, updated_by_role: str):
+async def override_commission_rate(
+    commission_id: str, 
+    override, 
+    updated_by_role: str,
+    actor_id: str = "system",
+    actor_name: str = "System Automated"
+):
     """Only HR Manager or CEO can override commission rate per deal."""
     if updated_by_role not in ["super_admin", "hr_manager"]:
         return None, "Only HR Manager or CEO can override commission rate"
@@ -324,6 +359,7 @@ async def override_commission_rate(commission_id: str, override, updated_by_role
     if commission["overall_status"] in ["Paid"]:
         return None, "Cannot modify a commission that has already been fully paid"
 
+    old_payload = commission_helper(commission)
     new_total = round(commission["total_contract_value"] * (override.rate / 100), 2)
 
     await db.commissions.update_one(
@@ -335,10 +371,30 @@ async def override_commission_rate(commission_id: str, override, updated_by_role
         }}
     )
     updated = await db.commissions.find_one({"commission_id": commission_id})
+    
+    # Trigger Audit Log
+    await log_action(
+        user_id=actor_id,
+        user_name=actor_name,
+        user_role=updated_by_role,
+        action="UPDATE_RATE",
+        entity="commission",
+        entity_id=commission_id,
+        old_value=old_payload,
+        new_value=commission_helper(updated),
+        description=f"Overridden core commission rate for deal {commission_id} to {override.rate}%."
+    )
+
     return commission_helper(updated), None
 
 
-async def set_commission_splits(commission_id: str, splits: list, updated_by_role: str):
+async def set_commission_splits(
+    commission_id: str, 
+    splits: list, 
+    updated_by_role: str,
+    actor_id: str = "system",
+    actor_name: str = "System Automated"
+):
     """SAL multi-rep: split commission attribution."""
     if updated_by_role not in ["super_admin", "hr_manager"]:
         return None, "Only HR Manager or CEO can configure commission splits"
@@ -351,6 +407,7 @@ async def set_commission_splits(commission_id: str, splits: list, updated_by_rol
     if commission["overall_status"] == "Paid":
         return None, "Cannot modify splits on a fully paid commission"
 
+    old_payload = commission_helper(commission)
     total_percentage = sum(s.percentage for s in splits)
     if round(total_percentage, 2) != 100.0:
         return None, f"Split percentages must total 100%, got {total_percentage}%"
@@ -361,6 +418,20 @@ async def set_commission_splits(commission_id: str, splits: list, updated_by_rol
         {"$set": {"splits": splits_data, "updated_at": datetime.utcnow()}}
     )
     updated = await db.commissions.find_one({"commission_id": commission_id})
+    
+    # Trigger Audit Log
+    await log_action(
+        user_id=actor_id,
+        user_name=actor_name,
+        user_role=updated_by_role,
+        action="UPDATE_SPLIT",
+        entity="commission",
+        entity_id=commission_id,
+        old_value=old_payload,
+        new_value=commission_helper(updated),
+        description=f"Applied modified distribution split layout for commission {commission_id}."
+    )
+    
     return commission_helper(updated), None
 
 
@@ -376,7 +447,6 @@ async def get_all_commissions(status: str = None, sales_rep_id: str = None):
 
 
 async def get_commission_summary(sales_rep_id: str = None):
-    """Commission dashboard summary — pending/approved/paid breakdown."""
     db = get_db()
     query = {}
     if sales_rep_id:
@@ -415,7 +485,6 @@ async def get_commission_summary(sales_rep_id: str = None):
 
 
 async def get_rep_rankings():
-    """Manager/CEO view: reps ranked by total commissions earned."""
     db = get_db()
     pipeline = [
         {"$group": {
@@ -439,10 +508,6 @@ async def get_rep_rankings():
 
 
 async def get_approved_commission_totals_by_rep():
-    """
-    FIN-03: Payroll engine uses this to fetch only Approved milestone payouts.
-    Returns dict: {sales_rep_id: total_approved_amount}
-    """
     db = get_db()
     commissions = await db.commissions.find({}).to_list(10000)
 

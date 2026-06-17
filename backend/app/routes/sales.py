@@ -31,7 +31,14 @@ async def create_new_lead(lead_data: LeadCreate, current_user=Depends(get_curren
     user = await db.users.find_one({"_id": ObjectId(db_user_id)})
     sales_rep_name = user["full_name"] if user else "Unknown"
 
-    lead = await create_lead(lead_data, sales_rep_id=db_user_id, sales_rep_name=sales_rep_name)
+    lead = await create_lead(
+        lead_data, 
+        sales_rep_id=db_user_id, 
+        sales_rep_name=sales_rep_name,
+        actor_id=current_user.get("user_id", "system"),
+        actor_name=current_user.get("full_name", "System Automated"),
+        actor_role=current_user.get("role", "system")
+    )
     return {"message": "Lead created successfully", "data": lead}
 
 
@@ -75,7 +82,13 @@ async def update_existing_lead(
     if role == "sales_rep" and lead["sales_rep_id"] != current_user.get("user_id"):
         raise HTTPException(status_code=403, detail="You can only update your own leads")
 
-    updated_lead, flag = await update_lead(lead_id, lead_data, updated_by_role=role)
+    updated_lead, flag = await update_lead(
+        lead_id, 
+        lead_data, 
+        updated_by_role=role,
+        actor_id=current_user.get("user_id", "system"),
+        actor_name=current_user.get("full_name", "System Automated")
+    )
     if updated_lead is None:
         raise HTTPException(status_code=403, detail=flag)
 
@@ -87,7 +100,12 @@ async def update_existing_lead(
 
 @router.delete("/leads/{lead_id}")
 async def delete_existing_lead(lead_id: str, current_user=Depends(get_current_sales_manager)):
-    await delete_lead(lead_id)
+    await delete_lead(
+        lead_id,
+        actor_id=current_user.get("user_id", "system"),
+        actor_name=current_user.get("full_name", "System Automated"),
+        actor_role=current_user.get("role", "system")
+    )
     return {"message": "Lead deleted successfully"}
 
 
@@ -152,7 +170,13 @@ async def update_commission_rate(
     override: CommissionRateOverride,
     current_user=Depends(get_current_user)
 ):
-    commission, error = await override_commission_rate(commission_id, override, current_user.get("role"))
+    commission, error = await override_commission_rate(
+        commission_id, 
+        override, 
+        updated_by_role=current_user.get("role"),
+        actor_id=current_user.get("user_id", "system"),
+        actor_name=current_user.get("full_name", "System Automated")
+    )
     if error:
         raise HTTPException(status_code=403, detail=error)
     return {"message": "Commission rate updated successfully", "data": commission}
@@ -164,7 +188,13 @@ async def update_commission_splits(
     request: CommissionSplitsRequest,
     current_user=Depends(get_current_user)
 ):
-    commission, error = await set_commission_splits(commission_id, request.splits, current_user.get("role"))
+    commission, error = await set_commission_splits(
+        commission_id, 
+        request.splits, 
+        updated_by_role=current_user.get("role"),
+        actor_id=current_user.get("user_id", "system"),
+        actor_name=current_user.get("full_name", "System Automated")
+    )
     if error:
         raise HTTPException(status_code=400, detail=error)
     return {"message": "Commission splits updated successfully", "data": commission}
@@ -178,9 +208,11 @@ async def approve_commission_milestone(
 ):
     """SAL-04: Approve a specific milestone's commission payout."""
     commission, error = await approve_milestone_payout(
-        commission_id, approval.milestone_id,
+        commission_id, 
+        approval.milestone_id,
         approved_by=current_user.get("user_id"),
-        approver_role=current_user.get("role")
+        approver_role=current_user.get("role"),
+        actor_name=current_user.get("full_name", "System Automated")
     )
     if error:
         raise HTTPException(status_code=400, detail=error)
@@ -195,8 +227,11 @@ async def reverse_commission_milestone(
 ):
     """SAL-06: Clawback - reverse a previously approved/paid milestone commission."""
     commission, error = await reverse_milestone_commission(
-        commission_id, milestone_id,
-        reversed_by_role=current_user.get("role")
+        commission_id, 
+        milestone_id,
+        reversed_by_role=current_user.get("role"),
+        actor_id=current_user.get("user_id", "system"),
+        actor_name=current_user.get("full_name", "System Automated")
     )
     if error:
         raise HTTPException(status_code=400, detail=error)

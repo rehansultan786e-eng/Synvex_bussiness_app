@@ -5,12 +5,14 @@
 # UPDATED:
 # - employee_helper() now returns new fields (cnic, dob, emergency contact,
 #   employment_type, reporting_manager, salary_id, onboarding_status)
-# - create_employee() stores new fields + initializes onboarding_status checklist
-# - update_employee() handles date_of_birth conversion
-# - NEW: update_onboarding_checklist() to mark onboarding steps complete
+# - create_employee() stores new fields + initializes onboarding_status checklist + logs action
+# - update_employee() handles date_of_birth conversion + logs action
+# - delete_employee() updates deletion state + logs action
+# - NEW: update_onboarding_checklist() to mark onboarding steps complete + logs action
 
 from app.database.connection import get_db
 from app.models.employee import EmployeeCreate, EmployeeUpdate, OnboardingChecklistUpdate
+from app.services.audit_log import log_action
 from bson import ObjectId
 from datetime import datetime
 
@@ -44,8 +46,12 @@ def employee_helper(employee) -> dict:
         })
     }
 
-
-async def create_employee(employee_data: EmployeeCreate):
+async def create_employee(
+    employee_data: EmployeeCreate,
+    actor_id: str = "system",
+    actor_name: str = "System Automated",
+    actor_role: str = "system"
+):
     db = get_db()
 
     # Unique ID check
@@ -94,8 +100,28 @@ async def create_employee(employee_data: EmployeeCreate):
     }
     result = await db.employees.insert_one(employee)
     new_employee = await db.employees.find_one({"_id": result.inserted_id})
-    return employee_helper(new_employee), None
 
+    # SRS 6.4.1: Initialize leave balance for the new employee
+    from app.services.leave_balance import initialize_leave_balance
+    await initialize_leave_balance(employee_data.employee_id)
+
+    # Transform data for safe audit payload mapping (stripping credential paths)
+    audit_new_payload = employee_helper(new_employee)
+
+    # Trigger Audit Log
+    await log_action(
+        user_id=actor_id,
+        user_name=actor_name,
+        user_role=actor_role,
+        action="CREATE",
+        entity="employee",
+        entity_id=employee_data.employee_id,
+        old_value=None,
+        new_value=audit_new_payload,
+        description=f"Onboarded and registered new employee file for {employee_data.full_name} ({employee_data.employee_id})."
+    )
+
+    return employee_helper(new_employee), None
 
 async def get_all_employees(department: str = None, status: str = None, search: str = None):
     db = get_db()
@@ -121,8 +147,22 @@ async def get_employee_by_id(employee_id: str):
     return None
 
 
-async def update_employee(employee_id: str, employee_data: EmployeeUpdate):
+async def update_employee(
+    employee_id: str, 
+    employee_data: EmployeeUpdate,
+    actor_id: str = "system",
+    actor_name: str = "System Automated",
+    actor_role: str = "system"
+):
     db = get_db()
+    
+    # Retrieve pre-update state for structured delta analytics
+    old_record = await db.employees.find_one({"employee_id": employee_id, "is_deleted": False})
+    if not old_record:
+        return None
+
+    old_payload = employee_helper(old_record)
+
     update_data = {k: v for k, v in employee_data.model_dump().items() if v is not None}
 
     if "joining_date" in update_data:
@@ -132,25 +172,75 @@ async def update_employee(employee_id: str, employee_data: EmployeeUpdate):
 
     update_data["updated_at"] = datetime.utcnow()
     await db.employees.update_one({"employee_id": employee_id}, {"$set": update_data})
-    return await get_employee_by_id(employee_id)
+    
+    updated_payload = await get_employee_by_id(employee_id)
+
+    # Trigger Audit Log
+    await log_action(
+        user_id=actor_id,
+        user_name=actor_name,
+        user_role=actor_role,
+        action="UPDATE",
+        entity="employee",
+        entity_id=employee_id,
+        old_value=old_payload,
+        new_value=updated_payload,
+        description=f"Updated demographic profiles or registry indices for employee ID: {employee_id}."
+    )
+
+    return updated_payload
 
 
-async def delete_employee(employee_id: str):
+async def delete_employee(
+    employee_id: str,
+    actor_id: str = "system",
+    actor_name: str = "System Automated",
+    actor_role: str = "system"
+):
     db = get_db()
+    
+    old_record = await db.employees.find_one({"employee_id": employee_id, "is_deleted": False})
+    if not old_record:
+        return False
+        
+    old_payload = employee_helper(old_record)
+
     await db.employees.update_one(
         {"employee_id": employee_id},
         {"$set": {"is_deleted": True, "updated_at": datetime.utcnow()}}
     )
+
+    # Trigger Audit Log
+    await log_action(
+        user_id=actor_id,
+        user_name=actor_name,
+        user_role=actor_role,
+        action="DELETE",
+        entity="employee",
+        entity_id=employee_id,
+        old_value=old_payload,
+        new_value={"is_deleted": True},
+        description=f"Soft deleted employee file entry from internal access structures for ID: {employee_id}."
+    )
+
     return True
 
 
 # ===== NEW: Onboarding checklist update (SRS 6.2) =====
 
-async def update_onboarding_checklist(employee_id: str, checklist: OnboardingChecklistUpdate):
+async def update_onboarding_checklist(
+    employee_id: str, 
+    checklist: OnboardingChecklistUpdate,
+    actor_id: str = "system",
+    actor_name: str = "System Automated",
+    actor_role: str = "system"
+):
     db = get_db()
     employee = await db.employees.find_one({"employee_id": employee_id, "is_deleted": False})
     if not employee:
         return None
+
+    old_payload = employee_helper(employee)
 
     current = employee.get("onboarding_status", {
         "documents_submitted": False,
@@ -165,4 +255,20 @@ async def update_onboarding_checklist(employee_id: str, checklist: OnboardingChe
         {"employee_id": employee_id},
         {"$set": {"onboarding_status": current, "updated_at": datetime.utcnow()}}
     )
-    return await get_employee_by_id(employee_id)
+    
+    updated_payload = await get_employee_by_id(employee_id)
+
+    # Trigger Audit Log
+    await log_action(
+        user_id=actor_id,
+        user_name=actor_name,
+        user_role=actor_role,
+        action="UPDATE_ONBOARDING",
+        entity="employee",
+        entity_id=employee_id,
+        old_value={"onboarding_status": old_payload.get("onboarding_status")},
+        new_value={"onboarding_status": updated_payload.get("onboarding_status")},
+        description=f"Modified specific operational onboarding checklist parameters for employee ID: {employee_id}."
+    )
+
+    return updated_payload

@@ -3,7 +3,7 @@
 # Audit Log routes (SRS 9.4 / FIN-10).
 # Read-only. Only Super Admin (CEO) can view audit logs.
 
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, Depends, Query
 from app.services.audit_log import get_all_audit_logs, get_entity_history
 from app.services.export import export_to_excel
 from app.utils.dependencies import get_current_super_admin
@@ -21,7 +21,6 @@ async def list_audit_logs(
     page_size: int = Query(50, ge=1, le=200),
     current_user=Depends(get_current_super_admin)
 ):
-    """Super Admin only — paginated, filterable audit trail."""
     result = await get_all_audit_logs(
         entity=entity, action=action, user_id=user_id,
         page=page, page_size=page_size
@@ -35,7 +34,6 @@ async def entity_audit_history(
     entity_id: str,
     current_user=Depends(get_current_super_admin)
 ):
-    """Full history of changes for one specific record."""
     history = await get_entity_history(entity, entity_id)
     return {"message": "Success", "data": history, "total": len(history)}
 

@@ -1,5 +1,6 @@
 from app.database.connection import get_db
 from app.models.expense import ExpenseCreate, ExpenseStatusUpdate
+from app.services.audit_log import log_action
 from datetime import datetime
 from bson import ObjectId
 
@@ -35,7 +36,12 @@ async def generate_expense_id():
     return f"EXP-{count + 1:05d}"
 
 
-async def create_expense(expense_data: ExpenseCreate, submitted_by: str, submitted_by_name: str):
+async def create_expense(
+    expense_data: ExpenseCreate, 
+    submitted_by: str, 
+    submitted_by_name: str,
+    actor_role: str = "employee"
+):
     db = get_db()
     expense_id = await generate_expense_id()
 
@@ -60,6 +66,19 @@ async def create_expense(expense_data: ExpenseCreate, submitted_by: str, submitt
     }
     result = await db.expenses.insert_one(expense)
     new_expense = await db.expenses.find_one({"_id": result.inserted_id})
+
+    # Trigger Audit Log for Expense Creation
+    await log_action(
+        user_id=submitted_by,
+        user_name=submitted_by_name,
+        user_role=actor_role,
+        action="CREATE",
+        entity="expense",
+        entity_id=expense_id,
+        old_value=None,
+        new_value=expense_helper(new_expense),
+        description=f"Submitted a new expense request ({expense_id}) for category '{expense_data.category}' amounting to {expense_data.amount}."
+    )
 
     # SRS notification trigger: "Expense submitted for approval" -> Finance Manager / CEO
     from app.services.notification import create_notification
@@ -106,7 +125,13 @@ async def get_expense_receipt_bytes(expense_id: str):
     return base64.b64decode(expense["receipt_base64"])
 
 
-async def update_expense_status(expense_id: str, status_update: ExpenseStatusUpdate, approved_by: str, approver_role: str):
+async def update_expense_status(
+    expense_id: str, 
+    status_update: ExpenseStatusUpdate, 
+    approved_by: str, 
+    approver_role: str,
+    actor_name: str = "System Automated"
+):
     """
     FIN-06: Finance Manager can approve standard expenses;
     CEO (super_admin) approves expenses requiring CEO approval (above threshold).
@@ -115,6 +140,8 @@ async def update_expense_status(expense_id: str, status_update: ExpenseStatusUpd
     expense = await db.expenses.find_one({"expense_id": expense_id, "is_deleted": False})
     if not expense:
         return None, "Expense not found"
+
+    old_payload = expense_helper(expense)
 
     if expense["status"] != "Pending":
         return None, f"Expense is already {expense['status']}"
@@ -133,6 +160,19 @@ async def update_expense_status(expense_id: str, status_update: ExpenseStatusUpd
     }
     await db.expenses.update_one({"expense_id": expense_id}, {"$set": update_data})
     updated = await db.expenses.find_one({"expense_id": expense_id})
+
+    # Trigger Audit Log for Status Change
+    await log_action(
+        user_id=approved_by,
+        user_name=actor_name,
+        user_role=approver_role,
+        action="UPDATE_STATUS",
+        entity="expense",
+        entity_id=expense_id,
+        old_value=old_payload,
+        new_value=expense_helper(updated),
+        description=f"Expense {expense_id} status updated to '{status_update.status}'."
+    )
 
     # Notify the submitter of the decision
     from app.services.notification import create_notification

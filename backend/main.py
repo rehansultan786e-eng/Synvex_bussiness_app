@@ -2,9 +2,13 @@ import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from app.database.connection import connect_db, disconnect_db
 from app.routes.auth import router as auth_router
 from app.routes.employee import router as employee_router
@@ -26,6 +30,11 @@ from app.routes.performance import router as performance_router
 from app.routes.offboarding import router as offboarding_router
 from app.routes.audit_log import router as audit_log_router
 
+# ===== Rate limiter setup (in-memory, per-IP) =====
+# Used selectively on sensitive auth endpoints (login, OTP, invites)
+# to prevent brute-force and spam abuse.
+limiter = Limiter(key_func=get_remote_address)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await connect_db()
@@ -43,6 +52,9 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
