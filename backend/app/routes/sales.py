@@ -136,6 +136,39 @@ async def list_all_meetings(
     return {"message": "Success", "data": meetings}
 
 
+# ===== SALES REPS LOOKUP (used by Finance module's Contract creation form) =====
+
+@router.get("/reps")
+async def list_sales_reps(current_user=Depends(get_current_user)):
+    """
+    Returns active sales reps for use in dropdowns (e.g. assigning a
+    sales rep to a Finance contract). Per SRS role split, contracts are
+    a Finance Manager responsibility, with Sales Manager also needing
+    visibility into team assignments. Sales Reps themselves do not need
+    this lookup, so they are excluded here.
+    """
+    if current_user.get("role") not in ["super_admin", "finance_manager", "sales_manager"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    from app.database.connection import get_db
+    db = get_db()
+    reps = await db.users.find(
+        {"role": "sales_rep", "is_active": True}
+    ).to_list(1000)
+
+    return {
+        "message": "Success",
+        "data": [
+            {
+                "id": str(rep["_id"]),
+                "full_name": rep["full_name"],
+                "email": rep["email"]
+            }
+            for rep in reps
+        ]
+    }
+
+
 # ===== COMMISSIONS (SAL-01 to SAL-06) =====
 
 @router.get("/commissions")

@@ -2,20 +2,15 @@
 #
 # Authentication routes.
 #
-# SRS 9.1: Login for super_admin and finance_manager now requires 2FA
-# (email OTP). Flow:
-#   1. POST /login -> if 2FA required, returns {"requires_2fa": true, "temp_token": ...}
-#                      (no access/refresh tokens yet)
-#                   -> if 2FA not required, returns normal TokenResponse directly
-#   2. POST /verify-2fa -> temp_token + otp -> returns TokenResponse
-#   3. POST /resend-2fa -> temp_token -> resends OTP (rate-limited)
+# UNIFIED LOGIN: All roles (super_admin, hr_manager, finance_manager,
+# sales_manager, sales_rep, employee) log in via the same email+password
+# endpoint. The separate employee_id-based login has been removed —
+# employees now have a linked account in the "users" collection
+# (role: "employee", linked_employee_id: <employee_id>).
 #
-# Invite permission rules (who can invite whom):
-# - super_admin (CEO)   -> can invite anyone: hr_manager, finance_manager,
-#                          sales_manager, sales_rep
-# - sales_manager        -> can invite: sales_rep
+# 2FA (SRS 9.1) is required only for super_admin and finance_manager.
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from app.models.user import (
     UserLogin, TokenResponse,
@@ -23,9 +18,11 @@ from app.models.user import (
     SetPasswordRequest, ResendInviteRequest
 )
 from app.models.two_factor import TwoFactorVerifyRequest, TwoFactorResendRequest
+from app.models.password_reset import ForgotPasswordRequest, ResetPasswordRequest
 from app.database.connection import get_db
 from app.utils.auth import hash_password, verify_password, create_access_token, create_refresh_token, verify_token
 from app.utils.dependencies import get_current_user
+from app.utils.rate_limiter import limiter
 from app.services.user import (
     create_invited_user, set_user_password_via_invite,
     resend_invite, get_all_users, get_user_by_email
@@ -33,23 +30,17 @@ from app.services.user import (
 from app.services.two_factor import (
     create_2fa_challenge, verify_otp, resend_otp, requires_2fa
 )
-from app.models.password_reset import ForgotPasswordRequest, ResetPasswordRequest
 from app.services.password_reset import request_password_reset, reset_password_with_token
-from datetime import datetime
-from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 security = HTTPBearer()
 
-class EmployeeLoginRequest(BaseModel):
-    employee_id: str
-    password: str
 
-
-# ===== LOGIN (2FA-aware) =====
+# ===== LOGIN (unified for all roles, 2FA-aware, rate-limited) =====
 
 @router.post("/login")
-async def login(credentials: UserLogin):
+@limiter.limit("10/minute")
+async def login(request: Request, credentials: UserLogin):
     db = get_db()
     user = await db.users.find_one({"email": credentials.email})
 
@@ -64,6 +55,16 @@ async def login(credentials: UserLogin):
 
     role = user["role"]
 
+    token_payload = {
+        "user_id": str(user["_id"]),
+        "email": user["email"],
+        "role": role
+    }
+    # Employees carry their linked employee_id in the token too, so
+    # employee-specific endpoints (attendance, payslips, etc.) can use it.
+    if role == "employee" and user.get("linked_employee_id"):
+        token_payload["employee_id"] = user["linked_employee_id"]
+
     if requires_2fa(role):
         temp_token = await create_2fa_challenge(str(user["_id"]), user["email"], role)
         return {
@@ -72,31 +73,33 @@ async def login(credentials: UserLogin):
             "message": "A verification code has been sent to your email."
         }
 
-    token_data = {
-        "user_id": str(user["_id"]),
-        "email": user["email"],
-        "role": role
-    }
     return {
         "requires_2fa": False,
-        "access_token": create_access_token(token_data),
-        "refresh_token": create_refresh_token(token_data),
+        "access_token": create_access_token(token_payload),
+        "refresh_token": create_refresh_token(token_payload),
         "token_type": "bearer"
     }
 
 
 @router.post("/verify-2fa", response_model=TokenResponse)
-async def verify_2fa_route(request: TwoFactorVerifyRequest):
-    """SRS 9.1: Completes login for super_admin/finance_manager after OTP verification."""
-    user_payload, error = await verify_otp(request.temp_token, request.otp)
+@limiter.limit("10/minute")
+async def verify_2fa_route(request: Request, payload: TwoFactorVerifyRequest):
+    user_payload, error = await verify_otp(payload.temp_token, payload.otp)
     if error:
         raise HTTPException(status_code=400, detail=error)
+
+    db = get_db()
+    from bson import ObjectId
+    user = await db.users.find_one({"_id": ObjectId(user_payload["user_id"])})
 
     token_data = {
         "user_id": user_payload["user_id"],
         "email": user_payload["email"],
         "role": user_payload["role"]
     }
+    if user and user["role"] == "employee" and user.get("linked_employee_id"):
+        token_data["employee_id"] = user["linked_employee_id"]
+
     return TokenResponse(
         access_token=create_access_token(token_data),
         refresh_token=create_refresh_token(token_data)
@@ -104,50 +107,12 @@ async def verify_2fa_route(request: TwoFactorVerifyRequest):
 
 
 @router.post("/resend-2fa")
-async def resend_2fa_route(request: TwoFactorResendRequest):
-    new_temp_token, error = await resend_otp(request.temp_token)
+@limiter.limit("5/minute")
+async def resend_2fa_route(request: Request, payload: TwoFactorResendRequest):
+    new_temp_token, error = await resend_otp(payload.temp_token)
     if error:
         raise HTTPException(status_code=400, detail=error)
     return {"temp_token": new_temp_token, "message": "A new verification code has been sent to your email."}
-
-
-# ===== EMPLOYEE LOGIN (unchanged) =====
-
-@router.post("/employee-login")
-async def employee_login(credentials: EmployeeLoginRequest):
-    db = get_db()
-    employee = await db.employees.find_one({
-        "employee_id": credentials.employee_id,
-        "is_deleted": False,
-        "status": "active"
-    })
-    if not employee:
-        raise HTTPException(status_code=401, detail="Employee ID not found or inactive")
-
-    from passlib.context import CryptContext
-    pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-    if not pwd_context.verify(credentials.password, employee.get("password", "")):
-        raise HTTPException(status_code=401, detail="Invalid password")
-
-    token_data = {
-        "employee_id": employee["employee_id"],
-        "full_name": employee["full_name"],
-        "department": employee["department"],
-        "role": "employee"
-    }
-    return {
-        "access_token": create_access_token(token_data),
-        "refresh_token": create_refresh_token(token_data),
-        "token_type": "bearer",
-        "role": "employee",
-        "employee": {
-            "employee_id": employee["employee_id"],
-            "full_name": employee["full_name"],
-            "department": employee["department"],
-            "designation": employee["designation"]
-        }
-    }
 
 
 # ===== ME =====
@@ -157,34 +122,31 @@ async def get_me(credentials: HTTPAuthorizationCredentials = Depends(security)):
     payload = verify_token(credentials.credentials)
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+
     db = get_db()
+    from bson import ObjectId
+    user = await db.users.find_one({"_id": ObjectId(payload["user_id"])})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
 
-    role = payload.get("role")
+    response = {
+        "id": str(user["_id"]),
+        "full_name": user["full_name"],
+        "email": user["email"],
+        "role": user["role"]
+    }
 
-    if role == "employee":
-        employee = await db.employees.find_one({"employee_id": payload["employee_id"]})
-        if not employee:
-            raise HTTPException(status_code=404, detail="Employee not found")
-        return {
-            "employee_id": employee["employee_id"],
-            "full_name": employee["full_name"],
-            "department": employee["department"],
-            "role": "employee"
-        }
-    else:
-        from bson import ObjectId
-        user = await db.users.find_one({"_id": ObjectId(payload["user_id"])})
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        return {
-            "id": str(user["_id"]),
-            "full_name": user["full_name"],
-            "email": user["email"],
-            "role": user["role"]
-        }
+    if user["role"] == "employee" and user.get("linked_employee_id"):
+        employee = await db.employees.find_one({"employee_id": user["linked_employee_id"]})
+        if employee:
+            response["employee_id"] = employee["employee_id"]
+            response["department"] = employee["department"]
+            response["designation"] = employee["designation"]
+
+    return response
 
 
-# ===== INVITE A NEW USER =====
+# ===== INVITE A NEW USER (managers only — employees are created via HR onboarding) =====
 
 @router.post("/invite-user", response_model=InviteUserResponse)
 async def invite_user(request: InviteUserRequest, current_user=Depends(get_current_user)):
@@ -231,14 +193,15 @@ async def set_password(request: SetPasswordRequest):
     return {"message": "Password set successfully. You can now log in."}
 
 
-# ===== RESEND INVITE =====
+# ===== RESEND INVITE (rate-limited: 3/minute per IP) =====
 
 @router.post("/resend-invite")
-async def resend_invite_route(request: ResendInviteRequest, current_user=Depends(get_current_user)):
+@limiter.limit("3/minute")
+async def resend_invite_route(request: Request, payload: ResendInviteRequest, current_user=Depends(get_current_user)):
     if current_user.get("role") not in ["super_admin", "sales_manager"]:
         raise HTTPException(status_code=403, detail="You do not have permission to resend invites")
 
-    invite_sent, error = await resend_invite(request.user_id)
+    invite_sent, error = await resend_invite(payload.user_id)
     if error:
         raise HTTPException(status_code=400, detail=error)
     return {"message": "Invite email resent", "invite_sent": invite_sent}
@@ -259,18 +222,20 @@ async def list_users(current_user=Depends(get_current_user)):
         return {"users": await get_all_users("sales_rep")}
     else:
         raise HTTPException(status_code=403, detail="You do not have permission to view users")
-    
-    # ===== PASSWORD RESET (SRS 9.1) =====
+
+
+# ===== PASSWORD RESET (SRS 9.1, rate-limited: 3/minute per IP) =====
 
 @router.post("/forgot-password")
-async def forgot_password(request: ForgotPasswordRequest):
-    await request_password_reset(request.email)
+@limiter.limit("3/minute")
+async def forgot_password(request: Request, payload: ForgotPasswordRequest):
+    await request_password_reset(payload.email)
     return {"message": "If an account exists with this email, a password reset link has been sent."}
 
 
 @router.post("/reset-password")
-async def reset_password(request: ResetPasswordRequest):
-    success, error = await reset_password_with_token(request.token, request.new_password)
+async def reset_password(payload: ResetPasswordRequest):
+    success, error = await reset_password_with_token(payload.token, payload.new_password)
     if not success:
         raise HTTPException(status_code=400, detail=error)
     return {"message": "Password reset successfully. You can now log in with your new password."}

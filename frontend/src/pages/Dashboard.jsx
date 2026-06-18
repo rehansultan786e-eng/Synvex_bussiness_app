@@ -2,6 +2,7 @@
 //
 // Placeholder dashboard shown right after login. Full role-specific
 // Executive/HR/Finance/Sales dashboards will replace this in later steps.
+// Updated to the Synvex violet/purple brand palette.
 
 import React from 'react';
 import { useAuth } from '../context/AuthContext';
@@ -32,6 +33,7 @@ const Dashboard = () => {
           <div key={label} className="bg-white rounded-card shadow-soft border border-gray-100 p-5">
             <p className="text-xs font-medium text-gray-400 uppercase tracking-wide">{label}</p>
             <p className="text-2xl font-semibold text-gray-900 mt-2">—</p>
+            <div className="mt-3 h-1 w-10 rounded-full bg-primary/20" />
           </div>
         ))}
       </div>

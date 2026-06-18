@@ -3,12 +3,10 @@
 # Employee model — extended per SRS Section 6.2 (Onboarding) and
 # Section 11 (Entity table: Employees, Users).
 #
-# NEW FIELDS ADDED:
-# - cnic, date_of_birth, personal_email, emergency_contact
-# - employment_type (Full-time / Part-time / Contract)
-# - reporting_manager (employee_id of manager)
-# - salary_id (links to Salaries collection, set after salary record created)
-# - onboarding_status (tracks onboarding checklist completion)
+# UNIFIED LOGIN: "password" here is used once, at creation time, to set
+# up the employee's linked login account in the "users" collection
+# (see services/employee.py). It is not stored on the employee document
+# itself.
 
 from pydantic import BaseModel, EmailStr
 from typing import Optional, Literal
@@ -26,16 +24,15 @@ class EmployeeCreate(BaseModel):
     designation: str
     joining_date: date
     status: str = "active"
-    password: str
+    password: str  # used to create the linked login account
 
-    # ===== NEW FIELDS (SRS 6.2 Onboarding) =====
-    cnic: Optional[str] = None                      # CNIC / passport number
+    cnic: Optional[str] = None
     date_of_birth: Optional[date] = None
     personal_email: Optional[EmailStr] = None
     emergency_contact_name: Optional[str] = None
     emergency_contact_phone: Optional[str] = None
     employment_type: EmploymentType = "Full-time"
-    reporting_manager: Optional[str] = None          # employee_id of manager
+    reporting_manager: Optional[str] = None
 
 
 class EmployeeUpdate(BaseModel):
@@ -46,9 +43,8 @@ class EmployeeUpdate(BaseModel):
     designation: Optional[str] = None
     joining_date: Optional[date] = None
     status: Optional[str] = None
-    password: Optional[str] = None
+    password: Optional[str] = None  # if provided, updates the linked login account's password
 
-    # ===== NEW FIELDS =====
     cnic: Optional[str] = None
     date_of_birth: Optional[date] = None
     personal_email: Optional[EmailStr] = None
@@ -70,7 +66,6 @@ class EmployeeResponse(BaseModel):
     status: str
     created_at: datetime
 
-    # ===== NEW FIELDS =====
     cnic: Optional[str] = None
     date_of_birth: Optional[str] = None
     personal_email: Optional[str] = None
@@ -78,11 +73,10 @@ class EmployeeResponse(BaseModel):
     emergency_contact_phone: Optional[str] = None
     employment_type: str = "Full-time"
     reporting_manager: Optional[str] = None
-    salary_id: Optional[str] = None                  # set when salary record created
-    onboarding_status: Optional[dict] = None          # e.g. {"documents": true, "asset_assigned": false, "system_access": true}
+    salary_id: Optional[str] = None
+    onboarding_status: Optional[dict] = None
 
 
-# ===== NEW: Onboarding checklist update request =====
 class OnboardingChecklistUpdate(BaseModel):
     documents_submitted: Optional[bool] = None
     asset_assigned: Optional[bool] = None

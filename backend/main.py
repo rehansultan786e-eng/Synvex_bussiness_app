@@ -6,9 +6,9 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from app.utils.rate_limiter import limiter
 from app.database.connection import connect_db, disconnect_db
 from app.routes.auth import router as auth_router
 from app.routes.employee import router as employee_router
@@ -29,11 +29,6 @@ from app.routes.assets import router as assets_router
 from app.routes.performance import router as performance_router
 from app.routes.offboarding import router as offboarding_router
 from app.routes.audit_log import router as audit_log_router
-
-# ===== Rate limiter setup (in-memory, per-IP) =====
-# Used selectively on sensitive auth endpoints (login, OTP, invites)
-# to prevent brute-force and spam abuse.
-limiter = Limiter(key_func=get_remote_address)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

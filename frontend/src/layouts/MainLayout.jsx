@@ -3,6 +3,7 @@
 // Main app shell: collapsible left sidebar + top navbar + content area
 // (rendered via <Outlet />). Sidebar menu items are filtered by the
 // logged-in user's role using src/config/navigation.js.
+// Updated to the Synvex violet/purple brand palette.
 
 import React, { useState } from 'react';
 import { Outlet, NavLink, useNavigate } from 'react-router-dom';
@@ -70,11 +71,9 @@ const MainLayout = () => {
         className={`${collapsed ? 'w-[72px]' : 'w-64'} bg-white border-r border-gray-100 flex flex-col transition-all duration-200`}
       >
         <div className="h-16 flex items-center px-4 border-b border-gray-100 shrink-0">
-          <div className="w-8 h-8 rounded-control bg-primary text-white flex items-center justify-center font-semibold text-sm shrink-0">
-            S
-          </div>
+          
           {!collapsed && (
-            <span className="ml-2.5 font-semibold text-gray-900 text-sm whitespace-nowrap">Synvex</span>
+            <span className="ml-2.5 font-bold text-gray-900 text-sm whitespace-nowrap tracking-tight">SYNVEX MANAGEMENT</span>
           )}
         </div>
 
@@ -101,7 +100,6 @@ const MainLayout = () => {
           onClick={() => setCollapsed((c) => !c)}
           className="h-12 flex items-center justify-center text-gray-400 hover:text-gray-600 border-t border-gray-100 shrink-0"
         >
-          <Icon name="dashboard" className="w-4 h-4 hidden" />
           <span className="text-xs">{collapsed ? '»' : '« Collapse'}</span>
         </button>
       </aside>
@@ -133,7 +131,7 @@ const MainLayout = () => {
                 onClick={() => setProfileOpen((p) => !p)}
                 className="flex items-center gap-2.5"
               >
-                <div className="w-8 h-8 rounded-full bg-primary-light/15 text-primary-light flex items-center justify-center text-xs font-semibold">
+                <div className="w-8 h-8 rounded-full bg-primary-light/15 text-primary flex items-center justify-center text-xs font-semibold">
                   {initials}
                 </div>
                 <div className="hidden sm:block text-left">

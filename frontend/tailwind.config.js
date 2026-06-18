@@ -1,8 +1,8 @@
 // tailwind.config.js
 //
 // Design tokens for the Synvex Business Management System.
-// Style direction: Apple + Stripe + Notion hybrid — clean white base,
-// soft navy primary, subtle shadows, rounded corners, minimal clutter.
+// Palette matches the Synvex logo: deep charcoal/black background accents
+// paired with a vivid purple/violet primary, on a clean white base.
 
 /** @type {import('tailwindcss').Config} */
 module.exports = {
@@ -13,19 +13,19 @@ module.exports = {
     extend: {
       colors: {
         primary: {
-          DEFAULT: '#1B3A6B',   // Soft Navy Blue — primary brand color
-          dark: '#15305a',
-          light: '#2E5BA8',     // Professional Blue — accent / hover states
+          DEFAULT: '#6D28D9',   // Synvex violet — primary brand color
+          dark: '#5B21B6',
+          light: '#8B5CF6',     // lighter violet — accent / hover states
         },
         surface: {
           DEFAULT: '#FFFFFF',
-          subtle: '#F7F9FC',    // soft gray section background
+          subtle: '#F7F6FB',    // soft lavender-tinted gray section background
         },
         status: {
-          pending: '#B45309',   // amber-ish text on amber-50 bg
-          approved: '#15803D',  // green
-          overdue: '#B91C1C',   // red
-          paid: '#1D4ED8',      // blue
+          pending: '#B45309',
+          approved: '#15803D',
+          overdue: '#B91C1C',
+          paid: '#1D4ED8',
         },
       },
       fontFamily: {

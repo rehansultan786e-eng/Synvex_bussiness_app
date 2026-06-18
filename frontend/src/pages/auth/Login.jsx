@@ -1,12 +1,12 @@
 // src/pages/auth/Login.jsx
 //
-// Login page. Two modes: "Manager Login" (email-based, for super_admin /
-// hr_manager / finance_manager / sales_manager / sales_rep) and
-// "Employee Login" (employee_id-based). Handles the 2FA step inline
-// when the backend responds with requires_2fa: true.
+// Unified login page (split-screen SaaS style). Single email + password
+// form for every role. The backend decides whether 2FA is required
+// (super_admin / finance_manager) and responds accordingly.
 
 import React, { useState } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
+import { Eye, EyeOff, Shield, Mail, Lock, AlertTriangle } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { authService } from '../../services/authService';
 
@@ -15,27 +15,31 @@ const Login = () => {
   const location = useLocation();
   const { login } = useAuth();
 
-  const [mode, setMode] = useState('manager'); // 'manager' | 'employee'
   const [step, setStep] = useState('credentials'); // 'credentials' | 'otp'
-
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [employeeId, setEmployeeId] = useState('');
-
   const [tempToken, setTempToken] = useState(null);
-  const [pendingRole, setPendingRole] = useState(null);
   const [otp, setOtp] = useState('');
 
-  const [error, setError] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
   const [resendCooldown, setResendCooldown] = useState(0);
 
   const redirectTo = location.state?.from?.pathname || '/';
 
-  const handleManagerLogin = async (e) => {
+  const completeLogin = async (access_token, refresh_token) => {
+    localStorage.setItem('access_token', access_token);
+    const me = await authService.getMe();
+    login(me, { access_token, refresh_token });
+    navigate(redirectTo, { replace: true });
+  };
+
+  const handleLogin = async (e) => {
     e.preventDefault();
     setError('');
     setLoading(true);
+
     try {
       const res = await authService.login(email, password);
 
@@ -46,50 +50,22 @@ const Login = () => {
         await completeLogin(res.access_token, res.refresh_token);
       }
     } catch (err) {
-      setError(err.message);
+      setError(err.message || 'Invalid email or password.');
     } finally {
       setLoading(false);
     }
-  };
-
-  const handleEmployeeLogin = async (e) => {
-    e.preventDefault();
-    setError('');
-    setLoading(true);
-    try {
-      const res = await authService.employeeLogin(employeeId, password);
-      const userData = {
-        employee_id: res.employee.employee_id,
-        full_name: res.employee.full_name,
-        department: res.employee.department,
-        designation: res.employee.designation,
-        role: 'employee',
-      };
-      login(userData, { access_token: res.access_token, refresh_token: res.refresh_token });
-      navigate(redirectTo, { replace: true });
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const completeLogin = async (access_token, refresh_token) => {
-    localStorage.setItem('access_token', access_token);
-    const me = await authService.getMe();
-    login(me, { access_token, refresh_token });
-    navigate(redirectTo, { replace: true });
   };
 
   const handleVerifyOtp = async (e) => {
     e.preventDefault();
     setError('');
     setLoading(true);
+
     try {
       const res = await authService.verify2FA(tempToken, otp);
       await completeLogin(res.access_token, res.refresh_token);
     } catch (err) {
-      setError(err.message);
+      setError(err.message || 'Invalid verification code.');
     } finally {
       setLoading(false);
     }
@@ -112,208 +88,173 @@ const Login = () => {
         });
       }, 1000);
     } catch (err) {
-      setError(err.message);
+      setError(err.message || 'Failed to resend code.');
     }
   };
 
-  const switchMode = (newMode) => {
-    setMode(newMode);
-    setStep('credentials');
-    setError('');
-    setEmail('');
-    setPassword('');
-    setEmployeeId('');
-  };
-
   return (
-    <div className="min-h-screen flex items-center justify-center bg-surface-subtle px-4">
-      <div className="w-full max-w-md">
+    <div className="min-h-screen bg-white flex items-center justify-center p-4">
+      <div className="w-full max-w-5xl bg-white rounded-2xl shadow-2xl overflow-hidden flex min-h-[600px] border border-slate-100">
 
-        {/* Brand header */}
-        <div className="text-center mb-8">
-          <div className="inline-flex items-center justify-center w-12 h-12 rounded-control bg-primary text-white font-semibold text-lg mb-4">
-            S
+        {/* LEFT SIDE: Purple Brand Layout */}
+        <div className="hidden lg:flex lg:w-1/2 bg-gradient-to-br from-purple-600 to-indigo-800 p-12 flex-col justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 bg-white rounded-xl flex items-center justify-center">
+              <Shield className="w-6 h-6 text-purple-600" />
+            </div>
+            <div>
+              <h1 className="text-white font-bold text-xl">SYNVEX</h1>
+              <p className="text-purple-200 text-xs">Next-Gen Solutions</p>
+            </div>
           </div>
-          <h1 className="text-2xl font-semibold text-gray-900">Synvex</h1>
-          <p className="text-sm text-gray-500 mt-1">Business Management System</p>
+          <div>
+            <div className="w-20 h-20 bg-white/10 rounded-2xl flex items-center justify-center mb-8 backdrop-blur">
+              <Shield className="w-10 h-10 text-white" />
+            </div>
+            <h2 className="text-white text-3xl font-bold mb-4">Synvex Business Management</h2>
+            <p className="text-purple-200 text-base leading-relaxed">
+              AI-powered face recognition attendance system for modern enterprises.
+            </p>
+            <div className="mt-8 space-y-3">
+              {['Face Recognition Technology', 'Real-time Analytics', 'Geo-Fencing Security'].map((item) => (
+                <div key={item} className="flex items-center gap-3">
+                  <div className="w-2 h-2 bg-purple-300 rounded-full" />
+                  <span className="text-purple-100 text-sm">{item}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <p className="text-purple-300 text-sm">© 2026 Synvex. All rights reserved.</p>
         </div>
 
-        {/* Card */}
-        <div className="bg-white rounded-card shadow-elevated border border-gray-100 p-8">
+        {/* RIGHT SIDE: Dynamic Form Side */}
+        <div className="w-full lg:w-1/2 p-12 flex flex-col justify-center">
+          <div className="max-w-sm mx-auto w-full">
 
-          {step === 'credentials' && (
-            <>
-              {/* Mode toggle */}
-              <div className="flex gap-1 mb-6 p-1 bg-surface-subtle rounded-control">
-                <button
-                  type="button"
-                  onClick={() => switchMode('manager')}
-                  className={`flex-1 py-2 text-sm font-medium rounded-control transition-colors ${
-                    mode === 'manager'
-                      ? 'bg-white text-primary shadow-soft'
-                      : 'text-gray-500 hover:text-gray-700'
-                  }`}
-                >
-                  Manager Login
-                </button>
-                <button
-                  type="button"
-                  onClick={() => switchMode('employee')}
-                  className={`flex-1 py-2 text-sm font-medium rounded-control transition-colors ${
-                    mode === 'employee'
-                      ? 'bg-white text-primary shadow-soft'
-                      : 'text-gray-500 hover:text-gray-700'
-                  }`}
-                >
-                  Employee Login
-                </button>
+            {/* Responsive Mobile Header */}
+            <div className="lg:hidden flex items-center gap-2 mb-8">
+              <Shield className="w-7 h-7 text-purple-600" />
+              <span className="font-bold text-xl text-slate-800">SYNVEX</span>
+            </div>
+
+            {error && (
+              <div className="bg-red-50 border border-red-200 text-red-600 rounded-xl p-3 mb-6 text-sm flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+                {error}
               </div>
+            )}
 
-              {error && (
-                <div className="mb-4 px-4 py-2.5 rounded-control bg-red-50 text-red-700 text-sm">
-                  {error}
-                </div>
-              )}
+            {step === 'credentials' && (
+              <>
+                <h2 className="text-2xl font-bold text-slate-800 mb-1">Welcome back</h2>
+                <p className="text-slate-500 text-sm mb-8">Sign in to your account</p>
 
-              {mode === 'manager' ? (
-                <form onSubmit={handleManagerLogin} className="space-y-4">
+                <form onSubmit={handleLogin} className="space-y-5">
                   <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1.5">
-                      Email
-                    </label>
-                    <input
-                      type="email"
-                      required
-                      value={email}
-                      onChange={(e) => setEmail(e.target.value)}
-                      className="w-full px-3.5 py-2.5 rounded-control border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-primary-light focus:border-primary-light transition-shadow"
-                      placeholder="you@synvex.com"
-                    />
+                    <label className="block text-sm font-medium text-slate-700 mb-1.5">Email Address</label>
+                    <div className="relative">
+                      <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                      <input
+                        type="email"
+                        value={email}
+                        onChange={(e) => setEmail(e.target.value)}
+                        placeholder="you@synvex.io"
+                        className="w-full pl-10 pr-4 py-3 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 transition"
+                        required
+                      />
+                    </div>
                   </div>
+
                   <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1.5">
-                      Password
-                    </label>
-                    <input
-                      type="password"
-                      required
-                      value={password}
-                      onChange={(e) => setPassword(e.target.value)}
-                      className="w-full px-3.5 py-2.5 rounded-control border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-primary-light focus:border-primary-light transition-shadow"
-                      placeholder="••••••••"
-                    />
+                    <label className="block text-sm font-medium text-slate-700 mb-1.5">Password</label>
+                    <div className="relative">
+                      <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                      <input
+                        type={showPassword ? 'text' : 'password'}
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        placeholder="Enter your password"
+                        className="w-full pl-10 pr-12 py-3 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 transition"
+                        required
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowPassword(!showPassword)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                      >
+                        {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                      </button>
+                    </div>
                   </div>
-                  <div className="text-right">
-                    <a href="/forgot-password" className="text-sm text-primary-light hover:underline">
+
+                  <div className="flex items-center justify-end">
+                    <a href="/forgot-password" className="text-sm text-purple-600 hover:text-purple-700 font-medium">
                       Forgot password?
                     </a>
                   </div>
+
                   <button
                     type="submit"
                     disabled={loading}
-                    className="w-full py-2.5 rounded-control bg-primary text-white text-sm font-medium hover:bg-primary-dark disabled:opacity-60 transition-colors"
+                    className="w-full bg-purple-600 hover:bg-purple-700 text-white py-3 rounded-xl font-semibold text-sm transition disabled:opacity-60"
                   >
                     {loading ? 'Signing in...' : 'Sign In'}
                   </button>
                 </form>
-              ) : (
-                <form onSubmit={handleEmployeeLogin} className="space-y-4">
+              </>
+            )}
+
+            {step === 'otp' && (
+              <>
+                <h2 className="text-2xl font-bold text-slate-800 mb-1">Verification Required</h2>
+                <p className="text-slate-500 text-sm mb-8">Enter the 6-digit code we sent to your email.</p>
+
+                <form onSubmit={handleVerifyOtp} className="space-y-5">
                   <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1.5">
-                      Employee ID
-                    </label>
                     <input
                       type="text"
                       required
-                      value={employeeId}
-                      onChange={(e) => setEmployeeId(e.target.value)}
-                      className="w-full px-3.5 py-2.5 rounded-control border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-primary-light focus:border-primary-light transition-shadow"
-                      placeholder="EMP001"
+                      maxLength={6}
+                      value={otp}
+                      onChange={(e) => setOtp(e.target.value.replace(/\D/g, ''))}
+                      className="w-full px-4 py-3 border border-slate-200 rounded-xl text-center text-xl tracking-widest font-bold focus:outline-none focus:ring-2 focus:ring-purple-500 transition"
+                      placeholder="000000"
                     />
                   </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1.5">
-                      Password
-                    </label>
-                    <input
-                      type="password"
-                      required
-                      value={password}
-                      onChange={(e) => setPassword(e.target.value)}
-                      className="w-full px-3.5 py-2.5 rounded-control border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-primary-light focus:border-primary-light transition-shadow"
-                      placeholder="••••••••"
-                    />
-                  </div>
+
                   <button
                     type="submit"
-                    disabled={loading}
-                    className="w-full py-2.5 rounded-control bg-primary text-white text-sm font-medium hover:bg-primary-dark disabled:opacity-60 transition-colors"
+                    disabled={loading || otp.length !== 6}
+                    className="w-full bg-purple-600 hover:bg-purple-700 text-white py-3 rounded-xl font-semibold text-sm transition disabled:opacity-60"
                   >
-                    {loading ? 'Signing in...' : 'Sign In'}
+                    {loading ? 'Verifying...' : 'Verify & Sign In'}
                   </button>
                 </form>
-              )}
-            </>
-          )}
 
-          {step === 'otp' && (
-            <>
-              <h2 className="text-lg font-semibold text-gray-900 mb-1">Verification required</h2>
-              <p className="text-sm text-gray-500 mb-6">
-                Enter the 6-digit code we sent to your email.
-              </p>
-
-              {error && (
-                <div className="mb-4 px-4 py-2.5 rounded-control bg-red-50 text-red-700 text-sm">
-                  {error}
+                <div className="mt-6 text-center text-sm text-slate-500">
+                  Didn't get a code?{' '}
+                  <button
+                    type="button"
+                    onClick={handleResendOtp}
+                    disabled={resendCooldown > 0}
+                    className="text-purple-600 font-medium hover:underline disabled:text-slate-400 disabled:no-underline"
+                  >
+                    {resendCooldown > 0 ? `Resend in ${resendCooldown}s` : 'Resend code'}
+                  </button>
                 </div>
-              )}
 
-              <form onSubmit={handleVerifyOtp} className="space-y-4">
-                <input
-                  type="text"
-                  required
-                  maxLength={6}
-                  value={otp}
-                  onChange={(e) => setOtp(e.target.value.replace(/\D/g, ''))}
-                  className="w-full px-3.5 py-2.5 rounded-control border border-gray-200 text-center text-lg tracking-widest focus:outline-none focus:ring-2 focus:ring-primary-light focus:border-primary-light transition-shadow"
-                  placeholder="000000"
-                />
-                <button
-                  type="submit"
-                  disabled={loading || otp.length !== 6}
-                  className="w-full py-2.5 rounded-control bg-primary text-white text-sm font-medium hover:bg-primary-dark disabled:opacity-60 transition-colors"
-                >
-                  {loading ? 'Verifying...' : 'Verify & Sign In'}
-                </button>
-              </form>
-
-              <div className="mt-4 text-center text-sm text-gray-500">
-                Didn't get a code?{' '}
                 <button
                   type="button"
-                  onClick={handleResendOtp}
-                  disabled={resendCooldown > 0}
-                  className="text-primary-light font-medium hover:underline disabled:text-gray-400 disabled:no-underline"
+                  onClick={() => { setStep('credentials'); setOtp(''); setError(''); }}
+                  className="mt-3 w-full text-center text-sm text-slate-400 hover:text-slate-600"
                 >
-                  {resendCooldown > 0 ? `Resend in ${resendCooldown}s` : 'Resend code'}
+                  ← Back to login
                 </button>
-              </div>
+              </>
+            )}
 
-              <button
-                type="button"
-                onClick={() => { setStep('credentials'); setOtp(''); setError(''); }}
-                className="mt-3 w-full text-center text-sm text-gray-400 hover:text-gray-600"
-              >
-                ← Back to login
-              </button>
-            </>
-          )}
+          </div>
         </div>
-
-        <p className="text-center text-xs text-gray-400 mt-6">
-          Synvex Private Limited — Internal Use Only
-        </p>
       </div>
     </div>
   );

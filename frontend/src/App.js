@@ -13,6 +13,7 @@ import Login from './pages/auth/Login';
 import Unauthorized from './pages/Unauthorized';
 import Dashboard from './pages/Dashboard';
 
+
 function App() {
   return (
     <AuthProvider>
@@ -21,6 +22,7 @@ function App() {
           {/* Public routes */}
           <Route path="/login" element={<Login />} />
           <Route path="/unauthorized" element={<Unauthorized />} />
+          
 
           {/* Protected routes — any authenticated user (no role restriction) */}
           <Route element={<ProtectedRoute />}>
