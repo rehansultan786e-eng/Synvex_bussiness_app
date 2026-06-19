@@ -4,6 +4,7 @@
 # and (NEW) invite tokens used for the "set your password" email flow.
 
 from passlib.context import CryptContext
+from passlib.exc import UnknownHashError
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
 from typing import Optional
@@ -29,7 +30,14 @@ def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    if not hashed_password:
+        return False
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except UnknownHashError:
+        return False
+    except ValueError:
+        return False
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()

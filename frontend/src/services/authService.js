@@ -25,4 +25,13 @@ export const authService = {
 
   resetPassword: (token, new_password) =>
     api.post('/api/auth/reset-password', { token, new_password }, { auth: false }),
+
+  inviteUser: (fullName, email, role) =>
+    api.post('/api/auth/invite-user', { full_name: fullName, email: email, role: role }),
+
+  getManagersAndReps: () =>
+    api.get('/api/auth/users'),
+
+  setPasswordViaInvite: (token, password) =>
+    api.post('/api/auth/set-password', { token, password }),
 };

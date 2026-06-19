@@ -259,7 +259,6 @@ async def get_executive_dashboard_summary():
     )
 
     # Assets
-    total_assets = await db.assets.count_documents({}) if await db.list_collection_names().__class__ else 0
     try:
         total_assets = await db.assets.count_documents({})
     except Exception:
